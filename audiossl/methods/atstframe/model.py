@@ -1,5 +1,6 @@
 from pytorch_lightning import LightningModule
-from transformers.optimization import AdamW, get_cosine_schedule_with_warmup
+from transformers.optimization import AdamW
+from transformers.optimization import WarmupLinearSchedule as get_linear_schedule_with_warmup
 from audiossl.utils.common import cosine_scheduler_step,get_params_groups
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch import nn
