@@ -6,3 +6,6 @@ tmp*
 nohup.out
 ckpts
 logs
+build
+resources
+models

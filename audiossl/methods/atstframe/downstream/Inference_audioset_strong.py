@@ -35,7 +35,8 @@ def load_label_display_names():
 
 
 DISPLAY_LABELS = load_label_display_names()
-SECONDS_PER_FRAME = 160 / 16000
+MEL_HOP_SAMPLES = 160
+TARGET_SAMPLE_RATE = 16000
 
 
 
@@ -48,6 +49,9 @@ class InferenceAudioSetStrong(nn.Module):
         self.head = LinearHead(768, 407, use_norm=False, affine=False)
         self._load_ckpt(ckpt_path)
         self.transform = self._transform()
+        self.seconds_per_prediction_frame = (
+            self.encoder.patch_w * MEL_HOP_SAMPLES / TARGET_SAMPLE_RATE
+        )
 
     def _transform(self):
         melspec_t = torchaudio.transforms.MelSpectrogram(
@@ -127,7 +131,7 @@ def plot_spec(x, save_path):
     plt.close()
 
 
-def plot_prediction(prediction, save_path, top_k=10, use_sec=False):
+def plot_prediction(prediction, save_path, top_k=10, use_sec=False, seconds_per_frame=None):
     frame_scores = prediction[0].detach().cpu()
     mean_scores = frame_scores.mean(dim=1)
     top_k = min(top_k, frame_scores.shape[0])
@@ -135,8 +139,9 @@ def plot_prediction(prediction, save_path, top_k=10, use_sec=False):
 
     plt.figure(figsize=(12, 4))
     if use_sec:
+        assert seconds_per_frame is not None
         num_frames = frame_scores.shape[1]
-        duration_sec = num_frames * SECONDS_PER_FRAME
+        duration_sec = num_frames * seconds_per_frame
         plt.imshow(
             frame_scores[top_indices].numpy(),
             aspect="auto",
@@ -212,6 +217,7 @@ if __name__ == "__main__":
                 os.path.join(args.output_dir, "prediction_topk.png"),
                 top_k=args.top_k,
                 use_sec=args.use_sec,
+                seconds_per_frame=model.seconds_per_prediction_frame,
             )
 
         if args.plot_attention:
