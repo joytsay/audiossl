@@ -12,6 +12,7 @@ import torch
 import torchaudio
 from torch import nn
 from torchvision import transforms
+from tqdm import tqdm
 
 from audiossl.methods.atstframe.downstream.comparison_models.models.frame_atst import FrameAST_base
 from audiossl.methods.atstframe.downstream.utils_as_strong.model_as_strong import LinearHead
@@ -149,6 +150,26 @@ def plot_spec(x, save_path):
     plt.close()
 
 
+def highlight_top_labels(ax, highlight_positions):
+    labels = ax.get_yticklabels()
+    cmap = plt.get_cmap("viridis")
+    anchor_values = [1.0, 0.6, 0.0]
+
+    for label_idx, score in zip(highlight_positions, anchor_values):
+        if label_idx >= len(labels):
+            continue
+        label = labels[label_idx]
+        color = cmap(float(score))
+        label.set_bbox(dict(facecolor=color, alpha=0.5, edgecolor=None))
+        label.set_fontweight("bold")
+
+
+def reset_top_label_highlights(ax):
+    for label in ax.get_yticklabels():
+        label.set_bbox(None)
+        label.set_fontweight("normal")
+
+
 def plot_prediction(prediction, save_path, top_k=10, use_sec=False, seconds_per_frame=None):
     frame_scores = prediction[0].detach().cpu()
     mean_scores = frame_scores.mean(dim=1)
@@ -175,6 +196,8 @@ def plot_prediction(prediction, save_path, top_k=10, use_sec=False, seconds_per_
         plt.xlabel("Frame")
         plt.yticks(range(top_k), [DISPLAY_LABELS[i]
                    for i in top_indices.tolist()])
+    
+    highlight_top_labels(plt.gca(), [0, 1, 2])
     plt.colorbar()
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
@@ -301,9 +324,11 @@ def parse_riff_wave_metadata(audio_path):
     }.get(format_tag, f"UNKNOWN_0x{format_tag:04X}")
 
     if bits_per_sample > 0 and num_channels > 0:
-        num_frames = len(data_chunk) // max(1, (bits_per_sample // 8) * num_channels)
+        num_frames = len(data_chunk) // max(1,
+                                            (bits_per_sample // 8) * num_channels)
     elif avg_bytes_per_sec > 0:
-        num_frames = int(round(len(data_chunk) * sample_rate / avg_bytes_per_sec))
+        num_frames = int(
+            round(len(data_chunk) * sample_rate / avg_bytes_per_sec))
     else:
         num_frames = 0
 
@@ -353,7 +378,8 @@ def decode_vms_g726_with_ffmpeg(audio_path, metadata):
         stderr=subprocess.PIPE,
         check=True,
     )
-    wav = torch.frombuffer(bytearray(process.stdout), dtype=torch.float32).clone()
+    wav = torch.frombuffer(bytearray(process.stdout),
+                           dtype=torch.float32).clone()
     wav = wav.reshape(-1, metadata.num_channels).transpose(0, 1).contiguous()
     return wav, decode_sample_rate
 
@@ -370,11 +396,10 @@ def load_audio_for_inference(audio_path, target_sr=16000, output_dir: Optional[s
         if codec_tag == "0x4148":
             wav, sr = decode_vms_g726_with_ffmpeg(audio_path, metadata)
             did_convert_telephony = True
-            print("decoded VMS telephony WAV (codec_tag 0x4148) with ffmpeg g726 fallback")
+            print(
+                "decoded VMS telephony WAV (codec_tag 0x4148) with ffmpeg g726 fallback")
         else:
-            raise RuntimeError(
-                f"failed to decode audio with torchaudio; unsupported codec {codec_name}"
-            )
+            raise RuntimeError(f"failed to decode audio with torchaudio; unsupported codec {codec_name}")
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
     original_wav = wav.clone()
@@ -383,7 +408,8 @@ def load_audio_for_inference(audio_path, target_sr=16000, output_dir: Optional[s
         wav = torchaudio.functional.resample(wav, sr, target_sr)
     if output_dir is not None and did_convert_telephony:
         os.makedirs(output_dir, exist_ok=True)
-        pcm_save_path = os.path.join(output_dir, "telephony_decoded_input_pcm.wav")
+        pcm_save_path = os.path.join(
+            output_dir, "telephony_decoded_input_pcm.wav")
         maybe_save_converted_pcm(wav, pcm_save_path, target_sr)
         comparison_save_path = os.path.join(
             output_dir, "telephony_decode_comparison.png")
@@ -395,8 +421,95 @@ def load_audio_for_inference(audio_path, target_sr=16000, output_dir: Optional[s
             comparison_save_path,
             codec_name,
         )
-        print(f"saved telephony decode comparison plot to {comparison_save_path}")
+        print(f"saved telephony decode comparison plot to { comparison_save_path}")
     return wav, sr, metadata
+
+
+def plot_prediction_animation(prediction, save_dir, top_k=10, use_sec=False, seconds_per_frame=None, frame_step=5):
+    frame_scores = prediction[0].detach().cpu()
+    mean_scores = frame_scores.mean(dim=1)
+    top_k = min(top_k, frame_scores.shape[0])
+    top_indices = torch.topk(mean_scores, k=top_k).indices
+
+    num_frames = frame_scores.shape[1]
+    displayed_scores = frame_scores[top_indices].numpy()
+
+    os.makedirs(os.path.join(save_dir, "frames"), exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    if use_sec:
+        assert seconds_per_frame is not None
+        duration_sec = num_frames * seconds_per_frame
+        ax.imshow(
+            displayed_scores,
+            aspect="auto",
+            origin="lower",
+            extent=[0, duration_sec, 0, top_k],
+        )
+        line = ax.axvline(x=0, color="red", linestyle="-", linewidth=2)
+        ax.set_xlabel("Seconds")
+        ax.set_yticks(torch.arange(top_k).float() + 0.5)
+        ax.set_yticklabels([DISPLAY_LABELS[i] for i in top_indices.tolist()])
+    else:
+        ax.imshow(displayed_scores, aspect="auto", origin="lower")
+        line = ax.axvline(x=0, color="red", linestyle="-", linewidth=2)
+        ax.set_xlabel("Frame")
+        ax.set_yticks(range(top_k))
+        ax.set_yticklabels([DISPLAY_LABELS[i] for i in top_indices.tolist()])
+
+    fig.colorbar(ax.images[0], ax=ax)
+    fig.tight_layout()
+
+    frame_indices = list(range(0, num_frames, max(1, frame_step)))
+
+    for output_frame_idx, i in enumerate(tqdm(frame_indices, desc="Saving animation frames")):
+        if use_sec:
+            line.set_xdata([i * seconds_per_frame, i * seconds_per_frame])
+        else:
+            line.set_xdata([i, i])
+
+        reset_top_label_highlights(ax)
+        frame_rank_positions = torch.topk(
+            frame_scores[top_indices, i], k=min(3, top_k)
+        ).indices.tolist()
+        highlight_top_labels(ax, frame_rank_positions)
+        fig.savefig(
+            os.path.join(save_dir, "frames", f"frame_{output_frame_idx:04d}.png"),
+            dpi=200,
+        )
+
+    plt.close(fig)
+
+
+def make_animated_video(wav_path, frames_dir, output_path, fps=25):
+    base_cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-i", os.path.join(frames_dir, "frame_%04d.png"),
+        "-i", wav_path,
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-pix_fmt", "yuv420p",
+        "-shortest",
+    ]
+    codec_variants = [
+        ["-c:v", "libx264", "-c:a", "aac", "-b:a", "192k"],
+        ["-c:v", "mpeg4", "-c:a", "aac", "-b:a", "192k"],
+    ]
+
+    last_error = None
+    for codec_args in codec_variants:
+        cmd = base_cmd + codec_args + [output_path]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print(f"saved animated video to {output_path}")
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            stderr = (exc.stderr or "").strip()
+            if stderr:
+                print(stderr)
+
+    raise RuntimeError("ffmpeg failed to create the video") from last_error
 
 
 if __name__ == "__main__":
@@ -406,8 +519,10 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--plot_attention", action="store_true")
     parser.add_argument("--plot_prediction", action="store_true")
-    parser.add_argument("--top_k", type=int, default=10)
+    parser.add_argument("--make_video", action="store_true")
+    parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--use_sec", action="store_true")
+    parser.add_argument("--frame_step", type=int, default=5)
     args = parser.parse_args()
 
     model = InferenceAudioSetStrong(args.ckpt_path)
@@ -434,13 +549,33 @@ if __name__ == "__main__":
         os.makedirs(args.output_dir, exist_ok=True)
 
         if args.plot_prediction:
-            plot_prediction(
-                prediction,
-                os.path.join(args.output_dir, "prediction_topk.png"),
-                top_k=args.top_k,
-                use_sec=args.use_sec,
-                seconds_per_frame=model.seconds_per_prediction_frame,
-            )
+            if args.make_video:
+                plot_prediction_animation(
+                    prediction,
+                    args.output_dir,
+                    top_k=args.top_k,
+                    use_sec=args.use_sec,
+                    seconds_per_frame=model.seconds_per_prediction_frame,
+                    frame_step=args.frame_step,
+                )
+                if args.audio_path is None:
+                    print("Error: --make_video requires --audio_path")
+                else:
+                    make_animated_video(
+                        args.audio_path,
+                        os.path.join(args.output_dir, "frames"),
+                        os.path.join(args.output_dir, "prediction_animation.mp4"),
+                        fps=1 / (model.seconds_per_prediction_frame * max(1, args.frame_step))
+                    )
+            else:
+                plot_path = os.path.join(args.output_dir, "prediction_topk.png")
+                plot_prediction(
+                    prediction,
+                    plot_path,
+                    top_k=args.top_k,
+                    use_sec=args.use_sec,
+                    seconds_per_frame=model.seconds_per_prediction_frame,
+                )
 
         if args.plot_attention:
             with torch.no_grad():
