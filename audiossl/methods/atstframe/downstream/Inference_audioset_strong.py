@@ -1,7 +1,11 @@
 
 import argparse
 import os
+import struct
+import subprocess
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import torch
@@ -37,13 +41,24 @@ def load_label_display_names():
 DISPLAY_LABELS = load_label_display_names()
 MEL_HOP_SAMPLES = 160
 TARGET_SAMPLE_RATE = 16000
+WAVE_FORMAT_PCM = 0x0001
+WAVE_FORMAT_ALAW = 0x0006
+WAVE_FORMAT_MULAW = 0x0007
+WAVE_FORMAT_VMS_G726 = 0x4148
 
 
-
+@dataclass
+class AudioMetadata:
+    sample_rate: int
+    num_frames: int
+    num_channels: int
+    bits_per_sample: int
+    encoding: str
+    codec_tag: Optional[str] = None
 
 
 class InferenceAudioSetStrong(nn.Module):
-    def __init__(self,ckpt_path):
+    def __init__(self, ckpt_path):
         super().__init__()
         self.encoder = FrameAST_base()
         self.head = LinearHead(768, 407, use_norm=False, affine=False)
@@ -56,40 +71,40 @@ class InferenceAudioSetStrong(nn.Module):
     def _transform(self):
         melspec_t = torchaudio.transforms.MelSpectrogram(
             16000, f_min=60, f_max=7800, hop_length=160, win_length=1024, n_fft=1024, n_mels=64)
-        to_db = torchaudio.transforms.AmplitudeToDB(stype="power",top_db=80)
-        normalize = MinMax(min=-79.6482,max=50.6842)
+        to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
+        normalize = MinMax(min=-79.6482, max=50.6842)
         return transforms.Compose([melspec_t,
-                                to_db,
-                                normalize])
+                                   to_db,
+                                   normalize])
 
-    
-    def _load_ckpt(self,ckpt_path):
-        s = torch.load(ckpt_path,map_location="cpu")
+    def _load_ckpt(self, ckpt_path):
+        s = torch.load(ckpt_path, map_location="cpu")
         state_dict = s["state_dict"]
         replaced_state_dict = {}
         for key in state_dict.keys():
-            replaced_state_dict[key.replace("encoder.encoder","encoder")] =  state_dict[key]
+            replaced_state_dict[key.replace(
+                "encoder.encoder", "encoder")] = state_dict[key]
 
         self.load_state_dict(replaced_state_dict)
 
     def _prepare_wav(self, wav):
-        if len(wav.shape)==2:
+        if len(wav.shape) == 2:
             wav = wav.unsqueeze(1)
         else:
             assert len(wav.shape) == 3
         return wav
 
     def _chunk_mel(self, mel):
-        chunk_len=1001 #10 secnods, consistent with the length of positional embedding
+        chunk_len = 1001  # 10 secnods, consistent with the length of positional embedding
         total_len = mel.shape[-1]
         num_chunks = total_len // chunk_len + 1
         for i in range(num_chunks):
             start = i*chunk_len
             end = min((i+1) * chunk_len, total_len)
             if end > start:
-                yield i, mel[:,:,:,start:end]
+                yield i, mel[:, :, :, start:end]
 
-    def predict(self,wav):
+    def predict(self, wav):
         """
         ==================================================
         args:
@@ -102,10 +117,12 @@ class InferenceAudioSetStrong(nn.Module):
         mel = self.transform(wav)
         output = []
         for _, mel_chunk in self._chunk_mel(mel):
-            len_chunk = torch.tensor([mel_chunk.shape[-1]]).expand(mel.shape[0]).to(wav.device)
-            output_chunk = self.encoder.get_intermediate_layers(mel_chunk,len_chunk,n=1,scene=False)
+            len_chunk = torch.tensor(
+                [mel_chunk.shape[-1]]).expand(mel.shape[0]).to(wav.device)
+            output_chunk = self.encoder.get_intermediate_layers(
+                mel_chunk, len_chunk, n=1, scene=False)
             output.append(output_chunk)
-        output=torch.cat(output,dim=1)
+        output = torch.cat(output, dim=1)
         output = self.head(output)
         return output
 
@@ -115,7 +132,8 @@ class InferenceAudioSetStrong(nn.Module):
         attentions = []
         mel_chunks = []
         for _, mel_chunk in self._chunk_mel(mel):
-            attentions.append(self.encoder.get_last_selfattention(mel_chunk)[-1])
+            attentions.append(
+                self.encoder.get_last_selfattention(mel_chunk)[-1])
             mel_chunks.append(mel_chunk)
         return mel, mel_chunks, attentions
 
@@ -149,11 +167,14 @@ def plot_prediction(prediction, save_path, top_k=10, use_sec=False, seconds_per_
             extent=[0, duration_sec, 0, top_k],
         )
         plt.xlabel("Seconds")
-        plt.yticks(torch.arange(top_k).float() + 0.5, [DISPLAY_LABELS[i] for i in top_indices.tolist()])
+        plt.yticks(torch.arange(top_k).float() + 0.5,
+                   [DISPLAY_LABELS[i] for i in top_indices.tolist()])
     else:
-        plt.imshow(frame_scores[top_indices].numpy(), aspect="auto", origin="lower")
+        plt.imshow(frame_scores[top_indices].numpy(),
+                   aspect="auto", origin="lower")
         plt.xlabel("Frame")
-        plt.yticks(range(top_k), [DISPLAY_LABELS[i] for i in top_indices.tolist()])
+        plt.yticks(range(top_k), [DISPLAY_LABELS[i]
+                   for i in top_indices.tolist()])
     plt.colorbar()
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
@@ -174,13 +195,208 @@ def plot_attention_chunk(attention, save_dir, prefix):
         )
 
 
-def load_audio_for_inference(audio_path, target_sr=16000):
-    wav, sr = torchaudio.load(audio_path)
+def waveform_to_mel(wav, sample_rate):
+    melspec_t = torchaudio.transforms.MelSpectrogram(
+        sample_rate,
+        f_min=60,
+        f_max=min(7800, sample_rate // 2),
+        hop_length=MEL_HOP_SAMPLES,
+        win_length=1024,
+        n_fft=1024,
+        n_mels=64,
+    )
+    to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
+    return to_db(melspec_t(wav))
+
+
+def plot_telephony_conversion_comparison(original_wav, original_sr, converted_wav, converted_sr, save_path, original_codec_name):
+    original_mel = waveform_to_mel(original_wav, original_sr)[
+        0].detach().cpu().numpy()
+    converted_mel = waveform_to_mel(converted_wav, converted_sr)[
+        0].detach().cpu().numpy()
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    axes[0].imshow(original_mel, aspect="auto", origin="lower")
+    axes[0].set_title(f"{original_codec_name} original decode")
+    axes[0].set_ylabel("Mel Bin")
+
+    axes[1].imshow(converted_mel, aspect="auto", origin="lower")
+    axes[1].set_title("PCM waveform used by inference")
+    axes[1].set_xlabel("Frame")
+    axes[1].set_ylabel("Mel Bin")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+def get_audio_metadata(audio_path):
+    try:
+        return torchaudio.info(audio_path)
+    except RuntimeError:
+        return parse_riff_wave_metadata(audio_path)
+
+
+def get_codec_name(metadata) -> str:
+    encoding = getattr(metadata, "encoding", None)
+    if encoding is None:
+        return "unknown"
+    return str(encoding)
+
+
+def print_audio_metadata(audio_path, metadata):
+    codec_name = get_codec_name(metadata)
+    print(f"audio_path: {audio_path}")
+    print(f"codec: {codec_name}")
+    codec_tag = getattr(metadata, "codec_tag", None)
+    if codec_tag is not None:
+        print(f"codec_tag: {codec_tag}")
+    print(f"sample_rate: {metadata.sample_rate}")
+    print(f"num_frames: {metadata.num_frames}")
+    print(f"num_channels: {metadata.num_channels}")
+    print(f"bits_per_sample: {metadata.bits_per_sample}")
+
+
+def maybe_save_converted_pcm(wav, save_path, target_sr):
+    torchaudio.save(save_path, wav, sample_rate=target_sr,
+                    encoding="PCM_S", bits_per_sample=16)
+    print(f"saved decoded PCM wav to {save_path}")
+
+
+def parse_riff_chunks(blob):
+    offset = 12
+    while offset + 8 <= len(blob):
+        chunk_id = blob[offset:offset + 4]
+        chunk_size = struct.unpack("<I", blob[offset + 4:offset + 8])[0]
+        chunk_start = offset + 8
+        chunk_end = chunk_start + chunk_size
+        yield chunk_id, blob[chunk_start:chunk_end]
+        offset = chunk_end + (chunk_size % 2)
+
+
+def parse_riff_wave_metadata(audio_path):
+    blob = Path(audio_path).read_bytes()
+    if blob[:4] != b"RIFF" or blob[8:12] != b"WAVE":
+        raise RuntimeError("unsupported audio file: not a RIFF/WAVE file")
+
+    fmt_chunk = None
+    data_chunk = None
+    for chunk_id, chunk_body in parse_riff_chunks(blob):
+        if chunk_id == b"fmt ":
+            fmt_chunk = chunk_body
+        elif chunk_id == b"data":
+            data_chunk = chunk_body
+
+    if fmt_chunk is None or data_chunk is None or len(fmt_chunk) < 16:
+        raise RuntimeError("invalid RIFF/WAVE file: missing fmt or data chunk")
+
+    format_tag, num_channels, sample_rate, avg_bytes_per_sec, block_align, bits_per_sample = struct.unpack(
+        "<HHIIHH", fmt_chunk[:16]
+    )
+    encoding = {
+        WAVE_FORMAT_PCM: "PCM_S",
+        WAVE_FORMAT_ALAW: "PCM_ALAW",
+        WAVE_FORMAT_MULAW: "PCM_MULAW",
+        WAVE_FORMAT_VMS_G726: "G726_ADPCM",
+    }.get(format_tag, f"UNKNOWN_0x{format_tag:04X}")
+
+    if bits_per_sample > 0 and num_channels > 0:
+        num_frames = len(data_chunk) // max(1, (bits_per_sample // 8) * num_channels)
+    elif avg_bytes_per_sec > 0:
+        num_frames = int(round(len(data_chunk) * sample_rate / avg_bytes_per_sec))
+    else:
+        num_frames = 0
+
+    return AudioMetadata(
+        sample_rate=sample_rate,
+        num_frames=num_frames,
+        num_channels=num_channels,
+        bits_per_sample=bits_per_sample,
+        encoding=encoding,
+        codec_tag=f"0x{format_tag:04X}",
+    )
+
+
+def extract_wav_data_chunk(audio_path):
+    blob = Path(audio_path).read_bytes()
+    for chunk_id, chunk_body in parse_riff_chunks(blob):
+        if chunk_id == b"data":
+            return chunk_body
+    raise RuntimeError("invalid RIFF/WAVE file: missing data chunk")
+
+
+def decode_vms_g726_with_ffmpeg(audio_path, metadata):
+    data_chunk = extract_wav_data_chunk(audio_path)
+    decode_sample_rate = 8000
+    process = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "g726",
+            "-ar",
+            str(decode_sample_rate),
+            "-ac",
+            str(metadata.num_channels),
+            "-i",
+            "pipe:0",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "pipe:1",
+        ],
+        input=data_chunk,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    wav = torch.frombuffer(bytearray(process.stdout), dtype=torch.float32).clone()
+    wav = wav.reshape(-1, metadata.num_channels).transpose(0, 1).contiguous()
+    return wav, decode_sample_rate
+
+
+def load_audio_for_inference(audio_path, target_sr=16000, output_dir: Optional[str] = None):
+    metadata = get_audio_metadata(audio_path)
+    codec_name = get_codec_name(metadata)
+    did_convert_telephony = False
+
+    try:
+        wav, sr = torchaudio.load(audio_path)
+    except RuntimeError:
+        codec_tag = getattr(metadata, "codec_tag", None)
+        if codec_tag == "0x4148":
+            wav, sr = decode_vms_g726_with_ffmpeg(audio_path, metadata)
+            did_convert_telephony = True
+            print("decoded VMS telephony WAV (codec_tag 0x4148) with ffmpeg g726 fallback")
+        else:
+            raise RuntimeError(
+                f"failed to decode audio with torchaudio; unsupported codec {codec_name}"
+            )
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
+    original_wav = wav.clone()
+    original_sr = sr
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
-    return wav, sr
+    if output_dir is not None and did_convert_telephony:
+        os.makedirs(output_dir, exist_ok=True)
+        pcm_save_path = os.path.join(output_dir, "telephony_decoded_input_pcm.wav")
+        maybe_save_converted_pcm(wav, pcm_save_path, target_sr)
+        comparison_save_path = os.path.join(
+            output_dir, "telephony_decode_comparison.png")
+        plot_telephony_conversion_comparison(
+            original_wav,
+            original_sr,
+            wav,
+            target_sr,
+            comparison_save_path,
+            codec_name,
+        )
+        print(f"saved telephony decode comparison plot to {comparison_save_path}")
+    return wav, sr, metadata
 
 
 if __name__ == "__main__":
@@ -197,9 +413,15 @@ if __name__ == "__main__":
     model = InferenceAudioSetStrong(args.ckpt_path)
 
     if args.audio_path is None:
-        wav = torch.randn(1,160000)
+        wav = torch.randn(1, 160000)
+        metadata = None
     else:
-        wav, original_sr = load_audio_for_inference(args.audio_path)
+        wav, original_sr, metadata = load_audio_for_inference(
+            args.audio_path,
+            target_sr=TARGET_SAMPLE_RATE,
+            output_dir=args.output_dir,
+        )
+        print_audio_metadata(args.audio_path, metadata)
         if original_sr != 16000:
             print(f"resampled audio from {original_sr} Hz to 16000 Hz")
 
@@ -223,10 +445,12 @@ if __name__ == "__main__":
         if args.plot_attention:
             with torch.no_grad():
                 mel, mel_chunks, attentions = model.get_attention(wav)
-            plot_spec(mel[0, 0].detach().cpu().numpy(), os.path.join(args.output_dir, "mel.png"))
+            plot_spec(mel[0, 0].detach().cpu().numpy(),
+                      os.path.join(args.output_dir, "mel.png"))
             for idx, mel_chunk in enumerate(mel_chunks):
                 plot_spec(
                     mel_chunk[0, 0].detach().cpu().numpy(),
                     os.path.join(args.output_dir, f"mel_chunk{idx}.png"),
                 )
-                plot_attention_chunk(attentions[idx], args.output_dir, prefix=f"chunk{idx}-")
+                plot_attention_chunk(
+                    attentions[idx], args.output_dir, prefix=f"chunk{idx}-")
