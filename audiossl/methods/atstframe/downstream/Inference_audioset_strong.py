@@ -146,14 +146,25 @@ def plot_spec(x, save_path):
     plt.xticks([])
     plt.yticks([])
     plt.margins(0, 0)
-    plt.savefig(save_path, dpi=500, pad_inches=-0.01, transparent=True)
+    plt.savefig(save_path, dpi=400, pad_inches=-0.01, transparent=True)
     plt.close()
 
 
-def highlight_top_labels(ax, highlight_positions):
-    labels = ax.get_yticklabels()
+def set_animated_y_labels(ax, base_labels, highlight_positions, label_scores):
     cmap = plt.get_cmap("viridis")
     anchor_values = [1.0, 0.6, 0.0]
+    updated_labels = list(base_labels)
+
+    for label_idx in highlight_positions:
+        if label_idx < len(updated_labels) and label_idx < len(label_scores):
+            updated_labels[label_idx] = f"{base_labels[label_idx]}  {float(label_scores[label_idx]):.3f}"
+
+    ax.set_yticklabels(updated_labels)
+    labels = ax.get_yticklabels()
+    for label in labels:
+        label.set_bbox(None)
+        label.set_fontweight("normal")
+        label.set_color("black")
 
     for label_idx, score in zip(highlight_positions, anchor_values):
         if label_idx >= len(labels):
@@ -162,12 +173,7 @@ def highlight_top_labels(ax, highlight_positions):
         color = cmap(float(score))
         label.set_bbox(dict(facecolor=color, alpha=0.5, edgecolor=None))
         label.set_fontweight("bold")
-
-
-def reset_top_label_highlights(ax):
-    for label in ax.get_yticklabels():
-        label.set_bbox(None)
-        label.set_fontweight("normal")
+        label.set_color("red")
 
 
 def plot_prediction(prediction, save_path, top_k=10, use_sec=False, seconds_per_frame=None):
@@ -425,7 +431,7 @@ def load_audio_for_inference(audio_path, target_sr=16000, output_dir: Optional[s
     return wav, sr, metadata
 
 
-def plot_prediction_animation(prediction, save_dir, top_k=10, use_sec=False, seconds_per_frame=None, frame_step=5):
+def plot_prediction_animation(prediction, save_dir, top_k=10, use_sec=False, seconds_per_frame=None, frame_step=5, figsize=(16, 6), save_dpi=300):
     frame_scores = prediction[0].detach().cpu()
     mean_scores = frame_scores.mean(dim=1)
     top_k = min(top_k, frame_scores.shape[0])
@@ -433,10 +439,11 @@ def plot_prediction_animation(prediction, save_dir, top_k=10, use_sec=False, sec
 
     num_frames = frame_scores.shape[1]
     displayed_scores = frame_scores[top_indices].numpy()
+    base_labels = [DISPLAY_LABELS[i] for i in top_indices.tolist()]
 
     os.makedirs(os.path.join(save_dir, "frames"), exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(12, 4))
+    fig, ax = plt.subplots(figsize=figsize)
     if use_sec:
         assert seconds_per_frame is not None
         duration_sec = num_frames * seconds_per_frame
@@ -449,13 +456,13 @@ def plot_prediction_animation(prediction, save_dir, top_k=10, use_sec=False, sec
         line = ax.axvline(x=0, color="red", linestyle="-", linewidth=2)
         ax.set_xlabel("Seconds")
         ax.set_yticks(torch.arange(top_k).float() + 0.5)
-        ax.set_yticklabels([DISPLAY_LABELS[i] for i in top_indices.tolist()])
+        ax.set_yticklabels(base_labels)
     else:
         ax.imshow(displayed_scores, aspect="auto", origin="lower")
         line = ax.axvline(x=0, color="red", linestyle="-", linewidth=2)
         ax.set_xlabel("Frame")
         ax.set_yticks(range(top_k))
-        ax.set_yticklabels([DISPLAY_LABELS[i] for i in top_indices.tolist()])
+        ax.set_yticklabels(base_labels)
 
     fig.colorbar(ax.images[0], ax=ax)
     fig.tight_layout()
@@ -468,14 +475,18 @@ def plot_prediction_animation(prediction, save_dir, top_k=10, use_sec=False, sec
         else:
             line.set_xdata([i, i])
 
-        reset_top_label_highlights(ax)
         frame_rank_positions = torch.topk(
             frame_scores[top_indices, i], k=min(3, top_k)
         ).indices.tolist()
-        highlight_top_labels(ax, frame_rank_positions)
+        set_animated_y_labels(
+            ax,
+            base_labels,
+            frame_rank_positions,
+            frame_scores[top_indices, i].tolist(),
+        )
         fig.savefig(
             os.path.join(save_dir, "frames", f"frame_{output_frame_idx:04d}.png"),
-            dpi=200,
+            dpi=save_dpi,
         )
 
     plt.close(fig)
