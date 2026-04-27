@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import queue
 import shutil
 import subprocess
@@ -13,6 +14,14 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RTSP_URL = "rtsp://admin:Admin123@192.168.5.157:554/profile1"
 DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_display_name.tsv"
 DEFAULT_CKPT = REPO_ROOT / "models" / "atst_ft_StrongAS_eps28.ckpt"
+LABEL_TSV_CHOICES = [
+    "mid_10_display_name.tsv",
+    "mid_20_display_name.tsv",
+    "mid_indoor_cctv_display_name.tsv",
+    "mid_industrial_hazard_display_name.tsv",
+    "mid_street_surveillance_display_name.tsv",
+    "mid_to_display_name.tsv",
+]
 TARGET_SAMPLE_RATE = 16000
 CHANNELS = 1
 BYTES_PER_SAMPLE = 2
@@ -25,12 +34,12 @@ class PredictionState:
     rtsp_url: str = DEFAULT_RTSP_URL
     label_tsv: str = str(DEFAULT_LABEL_TSV)
     ckpt_path: str = str(DEFAULT_CKPT)
-    device: str = "auto"
+    device: str = "cuda"
     status: str = "Idle"
     error: str = ""
     frame_index: int = 0
     updated_at: float = 0.0
-    top3: List[Dict[str, Any]] = field(default_factory=list)
+    top_labels: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class LabelMapper:
@@ -61,7 +70,8 @@ class LabelMapper:
                 parts = line.rstrip("\n").split("\t", 1)
                 if parts and parts[0]:
                     wanted.add(parts[0])
-        indices = [i for i, mid in enumerate(self.common_mids) if mid in wanted]
+        indices = [i for i, mid in enumerate(
+            self.common_mids) if mid in wanted]
         if not indices:
             raise ValueError(f"No labels from {label_tsv} match common_labels.txt")
         return indices
@@ -104,7 +114,7 @@ class RtspInferenceWorker:
                 error=self.state.error,
                 frame_index=self.state.frame_index,
                 updated_at=self.state.updated_at,
-                top3=list(self.state.top3),
+                top_labels=list(self.state.top_labels),
             )
 
     def start(
@@ -112,9 +122,10 @@ class RtspInferenceWorker:
         rtsp_url: str,
         label_tsv: str,
         ckpt_path: str,
-        device: str = "auto",
+        device: str = "cuda",
         window_seconds: float = 10.0,
         update_every_frames: int = 5,
+        top_n: int = 3,
     ) -> None:
         self.stop()
         self._stop_event.clear()
@@ -131,7 +142,8 @@ class RtspInferenceWorker:
             )
         self._thread = threading.Thread(
             target=self._run,
-            args=(rtsp_url, label_tsv, ckpt_path, device, window_seconds, update_every_frames),
+            args=(rtsp_url, label_tsv, ckpt_path, device,
+                  window_seconds, update_every_frames, top_n),
             daemon=True,
         )
         self._thread.start()
@@ -158,13 +170,13 @@ class RtspInferenceWorker:
             self.state.error = error
             self.state.running = status not in {"Error", "Stopped"}
 
-    def _set_prediction(self, frame_index: int, top3: List[Dict[str, Any]]) -> None:
+    def _set_prediction(self, frame_index: int, top_labels: List[Dict[str, Any]]) -> None:
         with self._lock:
             self.state.status = "Streaming"
             self.state.running = True
             self.state.frame_index = frame_index
             self.state.updated_at = time.time()
-            self.state.top3 = top3
+            self.state.top_labels = top_labels
 
     def _run(
         self,
@@ -174,10 +186,12 @@ class RtspInferenceWorker:
         device_name: str,
         window_seconds: float,
         update_every_frames: int,
+        top_n: int,
     ) -> None:
         try:
             if shutil.which("ffmpeg") is None:
-                raise RuntimeError("ffmpeg is required but was not found on PATH")
+                raise RuntimeError(
+                    "ffmpeg is required but was not found on PATH")
 
             np = _import_numpy()
             torch = _import_torch()
@@ -188,7 +202,8 @@ class RtspInferenceWorker:
             model = InferenceAudioSetStrong(str(Path(ckpt_path).expanduser()))
             model.to(device)
             if hasattr(model, "transform"):
-                model.transform = _move_transform_to_device(model.transform, device)
+                model.transform = _move_transform_to_device(
+                    model.transform, device)
             model.eval()
 
             samples_per_read = max(TARGET_SAMPLE_RATE // 2, 1)
@@ -232,7 +247,8 @@ class RtspInferenceWorker:
                     err = _collect_stderr(stderr_queue)
                     raise RuntimeError(err or "RTSP stream ended")
 
-                pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                pcm = np.frombuffer(chunk, dtype=np.int16).astype(
+                    np.float32) / 32768.0
                 audio = np.concatenate([audio, pcm])
                 if audio.size > max_samples:
                     audio = audio[-max_samples:]
@@ -243,9 +259,9 @@ class RtspInferenceWorker:
                 with torch.no_grad():
                     prediction = model.predict(wav)
                 scores = prediction[0, :, -update_every_frames:].mean(dim=1)
-                top3 = labels.topk(scores.detach().cpu().tolist(), k=3)
+                top_labels = labels.topk(scores.detach().cpu().tolist(), k=top_n)
                 frame_index += update_every_frames
-                self._set_prediction(frame_index, top3)
+                self._set_prediction(frame_index, top_labels)
 
         except Exception as exc:
             self._set_status("Error", str(exc))
@@ -263,7 +279,8 @@ def _import_numpy():
     try:
         import numpy as np
     except ImportError as exc:
-        raise RuntimeError("Install numpy to decode the ffmpeg PCM stream") from exc
+        raise RuntimeError(
+            "Install numpy to decode the ffmpeg PCM stream") from exc
     return np
 
 
@@ -271,7 +288,8 @@ def _import_torch():
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("Install torch and torchaudio to run inference") from exc
+        raise RuntimeError(
+            "Install torch and torchaudio to run inference") from exc
     return torch
 
 
@@ -281,12 +299,13 @@ def _import_inference_model():
             InferenceAudioSetStrong,
         )
     except ImportError as exc:
-        raise RuntimeError(f"Could not import ATST-Frame inference model: {exc}") from exc
+        raise RuntimeError(
+            f"Could not import ATST-Frame inference model: {exc}") from exc
     return InferenceAudioSetStrong
 
 
 def _resolve_device(torch: Any, device_name: str):
-    if device_name == "auto":
+    if device_name == "cuda":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_name)
 
@@ -335,15 +354,17 @@ def create_fastapi_app():
         from fastapi import FastAPI
         from pydantic import BaseModel
     except ImportError as exc:
-        raise RuntimeError("Install fastapi and pydantic to run the web API") from exc
+        raise RuntimeError(
+            "Install fastapi and pydantic to run the web API") from exc
 
     class ConnectRequest(BaseModel):
         rtsp_url: str = DEFAULT_RTSP_URL
         label_tsv: str = str(DEFAULT_LABEL_TSV)
         ckpt_path: str = str(DEFAULT_CKPT)
-        device: str = "auto"
+        device: str = "cuda"
         window_seconds: float = 10.0
         update_every_frames: int = 5
+        top_n: int = 3
 
     app = FastAPI(title="AudioSSL RTSP ATST-Frame")
 
@@ -359,7 +380,7 @@ def create_fastapi_app():
             "error": snapshot.error,
             "frame_index": snapshot.frame_index,
             "updated_at": snapshot.updated_at,
-            "top3": snapshot.top3,
+            "top_labels": snapshot.top_labels,
         }
 
     @app.post("/connect")
@@ -371,6 +392,7 @@ def create_fastapi_app():
             request.device,
             request.window_seconds,
             request.update_every_frames,
+            request.top_n,
         )
         return worker.snapshot().__dict__
 
@@ -388,8 +410,9 @@ def create_gradio_app():
     except ImportError as exc:
         raise RuntimeError("Install gradio to run the UI") from exc
 
-    def connect(rtsp_url, label_tsv, ckpt_path, device, window_seconds, update_every_frames):
-        worker.start(rtsp_url, label_tsv, ckpt_path, device, window_seconds, update_every_frames)
+    def connect(rtsp_url, label_tsv, ckpt_path, device, window_seconds, update_every_frames, top_n):
+        worker.start(rtsp_url, label_tsv, ckpt_path, device,
+                     window_seconds, update_every_frames, top_n)
         return _format_snapshot(worker.snapshot())
 
     def disconnect():
@@ -399,14 +422,31 @@ def create_gradio_app():
     def poll():
         return _format_snapshot(worker.snapshot())
 
-    with gr.Blocks(title="AudioSSL RTSP ATST-Frame") as demo:
-        gr.Markdown("# AudioSSL RTSP ATST-Frame")
+    def select_label_tsv(filename):
+        if not filename:
+            path = str(DEFAULT_LABEL_TSV)
+        else:
+            path = str(REPO_ROOT / filename)
+        return path, load_tsv_labels(path)
+
+    with gr.Blocks(title="GeoVision Sound-Event-Detection") as demo:
+        gr.Markdown("# GeoVision Sound-Event-Detection")
         with gr.Row():
-            rtsp_url = gr.Textbox(label="RTSP URL", value=DEFAULT_RTSP_URL, scale=3)
-            device = gr.Dropdown(label="Device", choices=["auto", "cpu", "cuda"], value="auto")
+            rtsp_url = gr.Textbox(
+                label="RTSP URL", value=DEFAULT_RTSP_URL, scale=3)
+            device = gr.Dropdown(label="Device", choices=[
+                                 "cpu", "cuda"], value="cuda")
         with gr.Row():
-            label_tsv = gr.Textbox(label="Label TSV", value=str(DEFAULT_LABEL_TSV), scale=2)
-            ckpt_path = gr.Textbox(label="Checkpoint", value=str(DEFAULT_CKPT), scale=2)
+            label_choice = gr.Dropdown(
+                label="Label TSV preset",
+                choices=LABEL_TSV_CHOICES,
+                value=DEFAULT_LABEL_TSV.name,
+                scale=1,
+            )
+            label_tsv = gr.Textbox(
+                label="Label TSV", value=str(DEFAULT_LABEL_TSV), scale=2)
+            ckpt_path = gr.Textbox(
+                label="Checkpoint", value=str(DEFAULT_CKPT), scale=2)
         with gr.Row():
             window_seconds = gr.Slider(
                 label="Audio window seconds",
@@ -422,21 +462,43 @@ def create_gradio_app():
                 value=5,
                 step=5,
             )
+            top_n = gr.Slider(
+                label="Top N labels",
+                minimum=1,
+                maximum=20,
+                value=3,
+                step=1,
+            )
         with gr.Row():
             connect_btn = gr.Button("Connect", variant="primary")
             disconnect_btn = gr.Button("Disconnect")
-        output = gr.JSON(label="Live top-3 labels")
+        output = gr.JSON(label="Live top labels")
+        all_labels = gr.JSON(label="All labels",
+                             value=load_tsv_labels(str(DEFAULT_LABEL_TSV)))
         timer = gr.Timer(value=1.0, active=True)
 
         connect_btn.click(
             connect,
-            inputs=[rtsp_url, label_tsv, ckpt_path, device, window_seconds, update_every_frames],
+            inputs=[rtsp_url, label_tsv, ckpt_path, device,
+                    window_seconds, update_every_frames, top_n],
             outputs=output,
         )
         disconnect_btn.click(disconnect, outputs=output)
+        label_choice.change(select_label_tsv, inputs=label_choice, outputs=[
+                            label_tsv, all_labels])
         timer.tick(poll, outputs=output)
 
     return demo
+
+
+def create_gradio_theme():
+    try:
+        import gradio as gr
+    except ImportError as exc:
+        raise RuntimeError("Install gradio to run the UI") from exc
+
+    return gr.themes.Base()
+
 
 
 def _format_snapshot(snapshot: PredictionState) -> Dict[str, Any]:
@@ -448,8 +510,35 @@ def _format_snapshot(snapshot: PredictionState) -> Dict[str, Any]:
         "ckpt_path": snapshot.ckpt_path,
         "frame_index": snapshot.frame_index,
         "updated_at": snapshot.updated_at,
-        "top3": snapshot.top3,
+        "top_labels": snapshot.top_labels,
     }
+
+
+def load_tsv_labels(label_tsv: str) -> Dict[str, Any]:
+    path = Path(label_tsv).expanduser()
+    if not path.exists():
+        return {"file_name": path.name, "count": 0, "labels": [], "error": f"{path} does not exist"}
+
+    mid_to_name = {}
+    names_path = REPO_ROOT / "mid_to_display_name.tsv"
+    if names_path.exists():
+        with names_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t", 1)
+                if len(parts) == 2:
+                    mid_to_name[parts[0]] = parts[1]
+
+    labels = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t", 1)
+            if not parts or not parts[0]:
+                continue
+            mid = parts[0]
+            label = parts[1] if len(
+                parts) == 2 and parts[1] else mid_to_name.get(mid, mid)
+            labels.append(label)
+    return {"file_name": path.name, "count": len(labels), "labels": labels}
 
 
 def create_app():
@@ -458,13 +547,38 @@ def create_app():
     try:
         import gradio as gr
 
-        app = gr.mount_gradio_app(app, demo, path="/")
+        mount_kwargs = {
+            "theme": gr.themes.Base(),
+        }
+        supported = inspect.signature(gr.mount_gradio_app).parameters
+        mount_kwargs = {
+            key: value for key, value in mount_kwargs.items() if key in supported
+        }
+        app = gr.mount_gradio_app(app, demo, path="/", **mount_kwargs)
     except AttributeError as exc:
-        raise RuntimeError("This app needs a Gradio version with mount_gradio_app") from exc
+        raise RuntimeError(
+            "This app needs a Gradio version with mount_gradio_app") from exc
     return app
 
 
-app = None if __name__ == "__main__" else create_app()
+class LazyApp:
+    def __init__(self):
+        self._app = None
+        self._lock = threading.Lock()
+
+    def _get_app(self):
+        if self._app is None:
+            with self._lock:
+                if self._app is None:
+                    self._app = create_app()
+        return self._app
+
+    async def __call__(self, scope, receive, send):
+        app = self._get_app()
+        await app(scope, receive, send)
+
+
+app = LazyApp()
 
 
 def main():
