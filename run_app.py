@@ -25,6 +25,9 @@ LABEL_TSV_CHOICES = [
 TARGET_SAMPLE_RATE = 16000
 CHANNELS = 1
 BYTES_PER_SAMPLE = 2
+DEFAULT_SILENCE_GATE_ENABLED = False
+DEFAULT_SILENCE_RMS_THRESHOLD = 0.005
+DEFAULT_SILENCE_PEAK_THRESHOLD = 0.03
 
 
 @dataclass
@@ -39,6 +42,11 @@ class PredictionState:
     error: str = ""
     frame_index: int = 0
     updated_at: float = 0.0
+    rms: float = 0.0
+    peak: float = 0.0
+    silence_gate_enabled: bool = DEFAULT_SILENCE_GATE_ENABLED
+    silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD
+    silence_peak_threshold: float = DEFAULT_SILENCE_PEAK_THRESHOLD
     top_labels: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -114,6 +122,11 @@ class RtspInferenceWorker:
                 error=self.state.error,
                 frame_index=self.state.frame_index,
                 updated_at=self.state.updated_at,
+                rms=self.state.rms,
+                peak=self.state.peak,
+                silence_gate_enabled=self.state.silence_gate_enabled,
+                silence_rms_threshold=self.state.silence_rms_threshold,
+                silence_peak_threshold=self.state.silence_peak_threshold,
                 top_labels=list(self.state.top_labels),
             )
 
@@ -126,6 +139,9 @@ class RtspInferenceWorker:
         window_seconds: float = 10.0,
         update_every_frames: int = 5,
         top_n: int = 3,
+        silence_gate_enabled: bool = DEFAULT_SILENCE_GATE_ENABLED,
+        silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD,
+        silence_peak_threshold: float = DEFAULT_SILENCE_PEAK_THRESHOLD,
     ) -> None:
         self.stop()
         self._stop_event.clear()
@@ -139,11 +155,16 @@ class RtspInferenceWorker:
                 device=device,
                 status="Starting",
                 error="",
+                silence_gate_enabled=silence_gate_enabled,
+                silence_rms_threshold=silence_rms_threshold,
+                silence_peak_threshold=silence_peak_threshold,
             )
         self._thread = threading.Thread(
             target=self._run,
             args=(rtsp_url, label_tsv, ckpt_path, device,
-                  window_seconds, update_every_frames, top_n),
+                  window_seconds, update_every_frames, top_n,
+                  silence_gate_enabled, silence_rms_threshold,
+                  silence_peak_threshold),
             daemon=True,
         )
         self._thread.start()
@@ -170,12 +191,30 @@ class RtspInferenceWorker:
             self.state.error = error
             self.state.running = status not in {"Error", "Stopped"}
 
-    def _set_prediction(self, frame_index: int, top_labels: List[Dict[str, Any]]) -> None:
+    def _set_quiet(self, frame_index: int, rms: float, peak: float) -> None:
+        with self._lock:
+            self.state.status = "Quiet"
+            self.state.running = True
+            self.state.frame_index = frame_index
+            self.state.updated_at = time.time()
+            self.state.rms = rms
+            self.state.peak = peak
+            self.state.top_labels = []
+
+    def _set_prediction(
+        self,
+        frame_index: int,
+        top_labels: List[Dict[str, Any]],
+        rms: float,
+        peak: float,
+    ) -> None:
         with self._lock:
             self.state.status = "Streaming"
             self.state.running = True
             self.state.frame_index = frame_index
             self.state.updated_at = time.time()
+            self.state.rms = rms
+            self.state.peak = peak
             self.state.top_labels = top_labels
 
     def _run(
@@ -187,6 +226,9 @@ class RtspInferenceWorker:
         window_seconds: float,
         update_every_frames: int,
         top_n: int,
+        silence_gate_enabled: bool,
+        silence_rms_threshold: float,
+        silence_peak_threshold: float,
     ) -> None:
         try:
             if shutil.which("ffmpeg") is None:
@@ -255,13 +297,23 @@ class RtspInferenceWorker:
                 if audio.size < max_samples:
                     continue
 
+                rms = float(np.sqrt(np.mean(audio ** 2)))
+                peak = float(np.max(np.abs(audio)))
+                frame_index += update_every_frames
+                if (
+                    silence_gate_enabled
+                    and rms < silence_rms_threshold
+                    and peak < silence_peak_threshold
+                ):
+                    self._set_quiet(frame_index, rms, peak)
+                    continue
+
                 wav = torch.from_numpy(audio.copy()).unsqueeze(0).to(device)
                 with torch.no_grad():
                     prediction = model.predict(wav)
                 scores = prediction[0, :, -update_every_frames:].mean(dim=1)
                 top_labels = labels.topk(scores.detach().cpu().tolist(), k=top_n)
-                frame_index += update_every_frames
-                self._set_prediction(frame_index, top_labels)
+                self._set_prediction(frame_index, top_labels, rms, peak)
 
         except Exception as exc:
             self._set_status("Error", str(exc))
@@ -365,6 +417,9 @@ def create_fastapi_app():
         window_seconds: float = 10.0
         update_every_frames: int = 5
         top_n: int = 3
+        silence_gate_enabled: bool = DEFAULT_SILENCE_GATE_ENABLED
+        silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD
+        silence_peak_threshold: float = DEFAULT_SILENCE_PEAK_THRESHOLD
 
     app = FastAPI(title="AudioSSL RTSP ATST-Frame")
 
@@ -380,6 +435,11 @@ def create_fastapi_app():
             "error": snapshot.error,
             "frame_index": snapshot.frame_index,
             "updated_at": snapshot.updated_at,
+            "rms": snapshot.rms,
+            "peak": snapshot.peak,
+            "silence_gate_enabled": snapshot.silence_gate_enabled,
+            "silence_rms_threshold": snapshot.silence_rms_threshold,
+            "silence_peak_threshold": snapshot.silence_peak_threshold,
             "top_labels": snapshot.top_labels,
         }
 
@@ -393,6 +453,9 @@ def create_fastapi_app():
             request.window_seconds,
             request.update_every_frames,
             request.top_n,
+            request.silence_gate_enabled,
+            request.silence_rms_threshold,
+            request.silence_peak_threshold,
         )
         return worker.snapshot().__dict__
 
@@ -410,9 +473,22 @@ def create_gradio_app():
     except ImportError as exc:
         raise RuntimeError("Install gradio to run the UI") from exc
 
-    def connect(rtsp_url, label_tsv, ckpt_path, device, window_seconds, update_every_frames, top_n):
+    def connect(
+        rtsp_url,
+        label_tsv,
+        ckpt_path,
+        device,
+        window_seconds,
+        update_every_frames,
+        top_n,
+        silence_gate_enabled,
+        silence_rms_threshold,
+        silence_peak_threshold,
+    ):
         worker.start(rtsp_url, label_tsv, ckpt_path, device,
-                     window_seconds, update_every_frames, top_n)
+                     window_seconds, update_every_frames, top_n,
+                     silence_gate_enabled, silence_rms_threshold,
+                     silence_peak_threshold)
         return _format_snapshot(worker.snapshot())
 
     def disconnect():
@@ -470,6 +546,25 @@ def create_gradio_app():
                 step=1,
             )
         with gr.Row():
+            silence_gate_enabled = gr.Checkbox(
+                label="Silence gate",
+                value=DEFAULT_SILENCE_GATE_ENABLED,
+            )
+            silence_rms_threshold = gr.Slider(
+                label="RMS threshold",
+                minimum=0.0,
+                maximum=0.1,
+                value=DEFAULT_SILENCE_RMS_THRESHOLD,
+                step=0.001,
+            )
+            silence_peak_threshold = gr.Slider(
+                label="Peak threshold",
+                minimum=0.0,
+                maximum=0.5,
+                value=DEFAULT_SILENCE_PEAK_THRESHOLD,
+                step=0.005,
+            )
+        with gr.Row():
             connect_btn = gr.Button("Connect", variant="primary")
             disconnect_btn = gr.Button("Disconnect")
         output = gr.JSON(label="Live top labels")
@@ -480,7 +575,9 @@ def create_gradio_app():
         connect_btn.click(
             connect,
             inputs=[rtsp_url, label_tsv, ckpt_path, device,
-                    window_seconds, update_every_frames, top_n],
+                    window_seconds, update_every_frames, top_n,
+                    silence_gate_enabled, silence_rms_threshold,
+                    silence_peak_threshold],
             outputs=output,
         )
         disconnect_btn.click(disconnect, outputs=output)
@@ -510,6 +607,11 @@ def _format_snapshot(snapshot: PredictionState) -> Dict[str, Any]:
         "ckpt_path": snapshot.ckpt_path,
         "frame_index": snapshot.frame_index,
         "updated_at": snapshot.updated_at,
+        "rms": snapshot.rms,
+        "peak": snapshot.peak,
+        "silence_gate_enabled": snapshot.silence_gate_enabled,
+        "silence_rms_threshold": snapshot.silence_rms_threshold,
+        "silence_peak_threshold": snapshot.silence_peak_threshold,
         "top_labels": snapshot.top_labels,
     }
 
