@@ -9,6 +9,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+import gradio as gr
+import numpy as np
+import torch
+import uvicorn
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from audiossl.methods.atstframe.downstream.Inference_audioset_strong import (
+    InferenceAudioSetStrong,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RTSP_URL = "rtsp://admin:Admin123@192.168.5.157:554/profile1"
@@ -19,6 +30,7 @@ LABEL_TSV_CHOICES = [
     "mid_20_display_name.tsv",
     "mid_indoor_cctv_display_name.tsv",
     "mid_industrial_hazard_display_name.tsv",
+    "mid_human_annoying_display_name.tsv",
     "mid_street_surveillance_display_name.tsv",
     "mid_to_display_name.tsv",
 ]
@@ -235,10 +247,6 @@ class RtspInferenceWorker:
                 raise RuntimeError(
                     "ffmpeg is required but was not found on PATH")
 
-            np = _import_numpy()
-            torch = _import_torch()
-            InferenceAudioSetStrong = _import_inference_model()
-
             device = _resolve_device(torch, device_name)
             labels = LabelMapper(Path(label_tsv).expanduser())
             model = InferenceAudioSetStrong(str(Path(ckpt_path).expanduser()))
@@ -327,35 +335,6 @@ class RtspInferenceWorker:
                     self.state.running = False
 
 
-def _import_numpy():
-    try:
-        import numpy as np
-    except ImportError as exc:
-        raise RuntimeError(
-            "Install numpy to decode the ffmpeg PCM stream") from exc
-    return np
-
-
-def _import_torch():
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError(
-            "Install torch and torchaudio to run inference") from exc
-    return torch
-
-
-def _import_inference_model():
-    try:
-        from audiossl.methods.atstframe.downstream.Inference_audioset_strong import (
-            InferenceAudioSetStrong,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Could not import ATST-Frame inference model: {exc}") from exc
-    return InferenceAudioSetStrong
-
-
 def _resolve_device(torch: Any, device_name: str):
     if device_name == "cuda":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -402,13 +381,6 @@ worker = RtspInferenceWorker()
 
 
 def create_fastapi_app():
-    try:
-        from fastapi import FastAPI
-        from pydantic import BaseModel
-    except ImportError as exc:
-        raise RuntimeError(
-            "Install fastapi and pydantic to run the web API") from exc
-
     class ConnectRequest(BaseModel):
         rtsp_url: str = DEFAULT_RTSP_URL
         label_tsv: str = str(DEFAULT_LABEL_TSV)
@@ -468,11 +440,6 @@ def create_fastapi_app():
 
 
 def create_gradio_app():
-    try:
-        import gradio as gr
-    except ImportError as exc:
-        raise RuntimeError("Install gradio to run the UI") from exc
-
     def connect(
         rtsp_url,
         label_tsv,
@@ -589,11 +556,6 @@ def create_gradio_app():
 
 
 def create_gradio_theme():
-    try:
-        import gradio as gr
-    except ImportError as exc:
-        raise RuntimeError("Install gradio to run the UI") from exc
-
     return gr.themes.Base()
 
 
@@ -647,8 +609,6 @@ def create_app():
     app = create_fastapi_app()
     demo = create_gradio_app()
     try:
-        import gradio as gr
-
         mount_kwargs = {
             "theme": gr.themes.Base(),
         }
@@ -688,10 +648,6 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
-    try:
-        import uvicorn
-    except ImportError as exc:
-        raise RuntimeError("Install uvicorn to run the server") from exc
     uvicorn.run(create_app(), host=args.host, port=args.port, reload=False)
 
 
