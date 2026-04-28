@@ -1,4 +1,5 @@
 import argparse
+import html
 import inspect
 import queue
 import shutil
@@ -31,15 +32,17 @@ LABEL_TSV_CHOICES = [
     "mid_indoor_cctv_display_name.tsv",
     "mid_industrial_hazard_display_name.tsv",
     "mid_human_annoying_display_name.tsv",
+    "mid_office_indoor_display_name.tsv",
     "mid_street_surveillance_display_name.tsv",
     "mid_to_display_name.tsv",
 ]
 TARGET_SAMPLE_RATE = 16000
 CHANNELS = 1
 BYTES_PER_SAMPLE = 2
-DEFAULT_SILENCE_GATE_ENABLED = False
+DEFAULT_SILENCE_GATE_ENABLED = True
 DEFAULT_SILENCE_RMS_THRESHOLD = 0.005
 DEFAULT_SILENCE_PEAK_THRESHOLD = 0.03
+DEFAULT_TOP1_ALERT_THRESHOLD = 0.01
 
 
 @dataclass
@@ -448,6 +451,7 @@ def create_gradio_app():
         window_seconds,
         update_every_frames,
         top_n,
+        top1_alert_threshold,
         silence_gate_enabled,
         silence_rms_threshold,
         silence_peak_threshold,
@@ -456,14 +460,14 @@ def create_gradio_app():
                      window_seconds, update_every_frames, top_n,
                      silence_gate_enabled, silence_rms_threshold,
                      silence_peak_threshold)
-        return _format_snapshot(worker.snapshot())
+        return _format_outputs(worker.snapshot(), top1_alert_threshold)
 
-    def disconnect():
+    def disconnect(top1_alert_threshold):
         worker.stop()
-        return _format_snapshot(worker.snapshot())
+        return _format_outputs(worker.snapshot(), top1_alert_threshold)
 
-    def poll():
-        return _format_snapshot(worker.snapshot())
+    def poll(top1_alert_threshold):
+        return _format_outputs(worker.snapshot(), top1_alert_threshold)
 
     def select_label_tsv(filename):
         if not filename:
@@ -512,6 +516,13 @@ def create_gradio_app():
                 value=3,
                 step=1,
             )
+            top1_alert_threshold = gr.Slider(
+                label="Top 1 alert confidence",
+                minimum=0.0,
+                maximum=1.0,
+                value=DEFAULT_TOP1_ALERT_THRESHOLD,
+                step=0.005,
+            )
         with gr.Row():
             silence_gate_enabled = gr.Checkbox(
                 label="Silence gate",
@@ -534,6 +545,7 @@ def create_gradio_app():
         with gr.Row():
             connect_btn = gr.Button("Connect", variant="primary")
             disconnect_btn = gr.Button("Disconnect")
+        top1_alert = gr.HTML(label="Top 1 alert")
         output = gr.JSON(label="Live top labels")
         all_labels = gr.JSON(label="All labels",
                              value=load_tsv_labels(str(DEFAULT_LABEL_TSV)))
@@ -543,20 +555,56 @@ def create_gradio_app():
             connect,
             inputs=[rtsp_url, label_tsv, ckpt_path, device,
                     window_seconds, update_every_frames, top_n,
+                    top1_alert_threshold,
                     silence_gate_enabled, silence_rms_threshold,
                     silence_peak_threshold],
-            outputs=output,
+            outputs=[output, top1_alert],
         )
-        disconnect_btn.click(disconnect, outputs=output)
+        disconnect_btn.click(
+            disconnect,
+            inputs=top1_alert_threshold,
+            outputs=[output, top1_alert],
+        )
         label_choice.change(select_label_tsv, inputs=label_choice, outputs=[
                             label_tsv, all_labels])
-        timer.tick(poll, outputs=output)
+        timer.tick(poll, inputs=top1_alert_threshold, outputs=[output, top1_alert])
 
     return demo
 
 
 def create_gradio_theme():
     return gr.themes.Base()
+
+
+def _format_outputs(snapshot: PredictionState, top1_alert_threshold: float):
+    return _format_snapshot(snapshot), _format_top1_alert(snapshot, top1_alert_threshold)
+
+
+def _format_top1_alert(snapshot: PredictionState, top1_alert_threshold: float) -> str:
+    if not snapshot.top_labels:
+        return ""
+
+    top_label = snapshot.top_labels[0]
+    confidence = float(top_label.get("confidence", 0.0))
+    if confidence < float(top1_alert_threshold):
+        return ""
+
+    label = html.escape(str(top_label.get("label", "Unknown")))
+    return (
+        '<button style="'
+        'background:#ffeb00;'
+        'color:#c00000;'
+        'border:3px solid #c00000;'
+        'border-radius:6px;'
+        'font-size:28px;'
+        'font-weight:800;'
+        'padding:16px 24px;'
+        'width:100%;'
+        'text-align:center;'
+        '">'
+        f'ALERT: {label} ({confidence:.3f})'
+        '</button>'
+    )
 
 
 
