@@ -2,6 +2,7 @@ import argparse
 import html
 import inspect
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -43,6 +44,11 @@ DEFAULT_SILENCE_GATE_ENABLED = True
 DEFAULT_SILENCE_RMS_THRESHOLD = 0.005
 DEFAULT_SILENCE_PEAK_THRESHOLD = 0.03
 DEFAULT_TOP1_ALERT_THRESHOLD = 0.01
+FFMPEG_IGNORED_ERROR_PATTERNS = (
+    r"\[s16le @ [^\]]+\] Application provided invalid, non monotonically increasing dts to muxer in stream \d+: \d+ >= \d+",
+    r"error parsing debug value debug=0",
+    r"Enter command: <target>\|all <time>\|-1 <command>\[ <argument>\]",
+)
 
 
 @dataclass
@@ -268,8 +274,13 @@ class RtspInferenceWorker:
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
+                "-nostdin",
                 "-loglevel",
                 "warning",
+                "-fflags",
+                "+genpts+discardcorrupt",
+                "-use_wallclock_as_timestamps",
+                "1",
                 "-rtsp_transport",
                 "tcp",
                 "-i",
@@ -298,7 +309,7 @@ class RtspInferenceWorker:
                 chunk = self._process.stdout.read(bytes_per_read)
                 if not chunk:
                     err = _collect_stderr(stderr_queue)
-                    raise RuntimeError(err or "RTSP stream ended")
+                    raise RuntimeError(_format_stream_error(err))
 
                 pcm = np.frombuffer(chunk, dtype=np.int16).astype(
                     np.float32) / 32768.0
@@ -378,6 +389,18 @@ def _collect_stderr(stderr_queue: "queue.Queue[str]") -> str:
         if line:
             lines.append(line)
     return "\n".join(lines[-8:])
+
+
+def _format_stream_error(stderr: str) -> str:
+    filtered = stderr
+    for pattern in FFMPEG_IGNORED_ERROR_PATTERNS:
+        filtered = re.sub(pattern, "", filtered)
+    filtered = "\n".join(
+        line.strip() for line in filtered.splitlines() if line.strip()
+    )
+    if filtered:
+        return filtered
+    return "RTSP stream ended or ffmpeg stopped without a fatal error message"
 
 
 worker = RtspInferenceWorker()
