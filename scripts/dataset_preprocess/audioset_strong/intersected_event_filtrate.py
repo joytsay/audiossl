@@ -37,7 +37,7 @@ def process_onset_offset(onset, offset):
 
 def rm_intersec(df):
     all_files = pd.unique(df["filename"].values)
-    return_df = pd.DataFrame([], columns=["filename", "onset", "offset", "event_label"])
+    rows = []
     for file in tqdm(all_files):
         file_df = df[df["filename"] == file]
         all_events = pd.unique(file_df["event_label"].values)
@@ -48,8 +48,10 @@ def rm_intersec(df):
             event_onsets = onset[event_mask]
             event_offsets = offset[event_mask]
             event_onsets, event_offsets = process_onset_offset(event_onsets, event_offsets)
-            return_df = return_df.append(pd.DataFrame({"filename": [file] * len(event_onsets), "onset": event_onsets, "offset": event_offsets, "event_label": [event] * len(event_onsets)}))
-    return return_df
+            rows.append(pd.DataFrame({"filename": [file] * len(event_onsets), "onset": event_onsets, "offset": event_offsets, "event_label": [event] * len(event_onsets)}))
+    if not rows:
+        return pd.DataFrame([], columns=["filename", "onset", "offset", "event_label"])
+    return pd.concat(rows, ignore_index=True)
 
 train_df = pd.read_csv("./train/train_common.tsv", delimiter="\t")
 eval_df = pd.read_csv("./eval/eval_common.tsv", delimiter="\t")

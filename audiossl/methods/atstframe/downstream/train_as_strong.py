@@ -89,11 +89,10 @@ def run(args, pretrained_module):
             freeze_mode=args.freeze_mode,
             lr_scale=args.lr_scale,
             )
-    strategy = None if n_gpus == 1 else DDPStrategy(find_unused_parameters=False)
+    strategy = {} if n_gpus == 1 else {"strategy": DDPStrategy(find_unused_parameters=False)}
     trainer: Trainer = Trainer(
-        strategy=strategy,
+        **strategy,
         num_sanity_val_steps=3,
-        flush_logs_every_n_steps=10,
         sync_batchnorm=False,
         accelerator="gpu",
         devices=args.nproc,

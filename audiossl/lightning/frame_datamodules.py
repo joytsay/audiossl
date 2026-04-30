@@ -73,6 +73,9 @@ class DownstreamDataModule(LightningDataModule):
                                                       "test",
                                                       transforms[2],
                                                       target_transform=target_transforms[2])
+        if dataset_name == "as_strong":
+            strong_dataset = self.dataset_train[0].dataset
+            self.num_labels = len(strong_dataset.encoder.labels)
         self.save_hyperparameters(ignore=ignores)
     def prepare_data(self):
         pass
