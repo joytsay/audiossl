@@ -20,13 +20,16 @@ from pydantic import BaseModel
 
 from audiossl.methods.atstframe.downstream.Inference_audioset_strong import (
     InferenceAudioSetStrong,
+    infer_label_path,
+    load_label_display_names,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RTSP_URL = "rtsp://admin:Admin123@192.168.5.157:554/profile1"
-DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_display_name.tsv"
-DEFAULT_CKPT = REPO_ROOT / "models" / "atst_ft_StrongAS_eps28.ckpt"
+DEFAULT_LABEL_TSV = REPO_ROOT / "mid_office_indoor_display_name.tsv"
+# DEFAULT_CKPT = REPO_ROOT / "models" / "atst_ft_StrongAS_eps28.ckpt"
+DEFAULT_CKPT = REPO_ROOT / "logs" /"as_strong_small" / "frameatst_small_freeze"  / "last.ckpt"
 LABEL_TSV_CHOICES = [
     "mid_10_display_name.tsv",
     "mid_20_display_name.tsv",
@@ -69,11 +72,12 @@ class PredictionState:
     silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD
     silence_peak_threshold: float = DEFAULT_SILENCE_PEAK_THRESHOLD
     top_labels: List[Dict[str, Any]] = field(default_factory=list)
+    active_labels: List[str] = field(default_factory=list)
 
 
 class LabelMapper:
-    def __init__(self, label_tsv: Path):
-        self.common_mids = self._read_common_mids()
+    def __init__(self, label_tsv: Path, model_labels: Optional[Sequence[str]] = None):
+        self.common_mids = list(model_labels) if model_labels is not None else self._read_common_mids()
         self.mid_to_name = self._read_mid_names()
         self.selected = self._read_selected(label_tsv)
 
@@ -102,11 +106,11 @@ class LabelMapper:
         indices = [i for i, mid in enumerate(
             self.common_mids) if mid in wanted]
         if not indices:
-            raise ValueError(f"No labels from {label_tsv} match common_labels.txt")
+            indices = list(range(len(self.common_mids)))
         return indices
 
     def topk(self, scores: Sequence[float], k: int = 3) -> List[Dict[str, Any]]:
-        selected_scores = [(idx, float(scores[idx])) for idx in self.selected]
+        selected_scores = [(idx, float(scores[idx])) for idx in self.selected if idx < len(scores)]
         selected_scores.sort(key=lambda item: item[1], reverse=True)
         results = []
         for rank, (label_index, confidence) in enumerate(selected_scores[:k], start=1):
@@ -149,6 +153,7 @@ class RtspInferenceWorker:
                 silence_rms_threshold=self.state.silence_rms_threshold,
                 silence_peak_threshold=self.state.silence_peak_threshold,
                 top_labels=list(self.state.top_labels),
+                active_labels=list(self.state.active_labels),
             )
 
     def start(
@@ -238,6 +243,10 @@ class RtspInferenceWorker:
             self.state.peak = peak
             self.state.top_labels = top_labels
 
+    def _set_active_labels(self, labels: Sequence[str]) -> None:
+        with self._lock:
+            self.state.active_labels = list(labels)
+
     def _run(
         self,
         rtsp_url: str,
@@ -257,8 +266,9 @@ class RtspInferenceWorker:
                     "ffmpeg is required but was not found on PATH")
 
             device = _resolve_device(torch, device_name)
-            labels = LabelMapper(Path(label_tsv).expanduser())
             model = InferenceAudioSetStrong(str(Path(ckpt_path).expanduser()))
+            self._set_active_labels(model.display_labels)
+            labels = LabelMapper(Path(label_tsv).expanduser(), model.display_labels)
             model.to(device)
             if hasattr(model, "transform"):
                 model.transform = _move_transform_to_device(
@@ -483,7 +493,9 @@ def create_gradio_app():
                      window_seconds, update_every_frames, top_n,
                      silence_gate_enabled, silence_rms_threshold,
                      silence_peak_threshold)
-        return _format_outputs(worker.snapshot(), top1_alert_threshold)
+        snapshot = worker.snapshot()
+        snapshot.active_labels = load_checkpoint_labels(ckpt_path)
+        return _format_outputs(snapshot, top1_alert_threshold)
 
     def disconnect(top1_alert_threshold):
         worker.stop()
@@ -497,7 +509,9 @@ def create_gradio_app():
             path = str(DEFAULT_LABEL_TSV)
         else:
             path = str(REPO_ROOT / filename)
-        return path, load_tsv_labels(path)
+        snapshot = worker.snapshot()
+        snapshot.label_tsv = path
+        return path, _format_active_labels(snapshot)
 
     with gr.Blocks(title="GeoVision Sound-Event-Detection") as demo:
         gr.Markdown("# GeoVision Sound-Event-Detection")
@@ -571,7 +585,10 @@ def create_gradio_app():
         top1_alert = gr.HTML(label="Top 1 alert")
         output = gr.JSON(label="Live top labels")
         all_labels = gr.JSON(label="All labels",
-                             value=load_tsv_labels(str(DEFAULT_LABEL_TSV)))
+                             value=_format_active_labels(PredictionState(
+                                 label_tsv=str(DEFAULT_LABEL_TSV),
+                                 active_labels=load_checkpoint_labels(str(DEFAULT_CKPT)),
+                             )))
         timer = gr.Timer(value=1.0, active=True)
 
         connect_btn.click(
@@ -581,16 +598,16 @@ def create_gradio_app():
                     top1_alert_threshold,
                     silence_gate_enabled, silence_rms_threshold,
                     silence_peak_threshold],
-            outputs=[output, top1_alert],
+            outputs=[output, top1_alert, all_labels],
         )
         disconnect_btn.click(
             disconnect,
             inputs=top1_alert_threshold,
-            outputs=[output, top1_alert],
+            outputs=[output, top1_alert, all_labels],
         )
         label_choice.change(select_label_tsv, inputs=label_choice, outputs=[
                             label_tsv, all_labels])
-        timer.tick(poll, inputs=top1_alert_threshold, outputs=[output, top1_alert])
+        timer.tick(poll, inputs=top1_alert_threshold, outputs=[output, top1_alert, all_labels])
 
     return demo
 
@@ -600,7 +617,11 @@ def create_gradio_theme():
 
 
 def _format_outputs(snapshot: PredictionState, top1_alert_threshold: float):
-    return _format_snapshot(snapshot), _format_top1_alert(snapshot, top1_alert_threshold)
+    return (
+        _format_snapshot(snapshot),
+        _format_top1_alert(snapshot, top1_alert_threshold),
+        _format_active_labels(snapshot),
+    )
 
 
 def _format_top1_alert(snapshot: PredictionState, top1_alert_threshold: float) -> str:
@@ -646,7 +667,35 @@ def _format_snapshot(snapshot: PredictionState) -> Dict[str, Any]:
         "silence_rms_threshold": snapshot.silence_rms_threshold,
         "silence_peak_threshold": snapshot.silence_peak_threshold,
         "top_labels": snapshot.top_labels,
+        "active_labels": snapshot.active_labels,
     }
+
+
+def _format_active_labels(snapshot: PredictionState) -> Dict[str, Any]:
+    if snapshot.active_labels:
+        return {
+            "source": "active checkpoint labels",
+            "count": len(snapshot.active_labels),
+            "labels": snapshot.active_labels,
+        }
+    return load_tsv_labels(snapshot.label_tsv)
+
+
+def load_checkpoint_labels(ckpt_path: str) -> List[str]:
+    try:
+        checkpoint = torch.load(str(Path(ckpt_path).expanduser()), map_location="cpu")
+        state_dict = checkpoint["state_dict"]
+        num_labels = state_dict["head.linear.weight"].shape[0]
+        label_path = infer_label_path(num_labels)
+        if label_path:
+            labels = load_label_display_names(label_path)
+        else:
+            labels = [str(i) for i in range(num_labels)]
+        if len(labels) < num_labels:
+            labels.extend(str(i) for i in range(len(labels), num_labels))
+        return labels
+    except Exception:
+        return []
 
 
 def load_tsv_labels(label_tsv: str) -> Dict[str, Any]:

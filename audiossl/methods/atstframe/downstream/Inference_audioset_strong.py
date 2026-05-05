@@ -22,8 +22,8 @@ from audiossl.transforms.common import MinMax
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
-def load_label_display_names():
-    common_labels_path = REPO_ROOT / "common_labels.txt"
+def load_label_display_names(common_labels_path=None):
+    common_labels_path = Path(common_labels_path) if common_labels_path else REPO_ROOT / "common_labels.txt"
     mid_to_display_name_path = REPO_ROOT / "mid_to_display_name.tsv"
 
     with common_labels_path.open() as f:
@@ -37,6 +37,21 @@ def load_label_display_names():
                 mid_to_display_name[parts[0]] = parts[1]
 
     return [mid_to_display_name.get(mid, mid) for mid in label_mids]
+
+
+def infer_label_path(num_labels):
+    candidates = [
+        REPO_ROOT / "AudioSet_strong" / "meta" / "common_labels.txt",
+        REPO_ROOT / "common_labels.txt",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        with path.open() as f:
+            labels = [line.strip() for line in f if line.strip()]
+        if len(labels) in (num_labels, num_labels - 1):
+            return path
+    return None
 
 
 DISPLAY_LABELS = load_label_display_names()
@@ -59,11 +74,21 @@ class AudioMetadata:
 
 
 class InferenceAudioSetStrong(nn.Module):
-    def __init__(self, ckpt_path):
+    def __init__(self, ckpt_path, label_path=None):
         super().__init__()
+        state_dict = self._read_ckpt_state_dict(ckpt_path)
+        self.num_labels = self._infer_num_labels(state_dict)
+        self.label_path = Path(label_path) if label_path else infer_label_path(self.num_labels)
+        self.display_labels = (
+            load_label_display_names(self.label_path)
+            if self.label_path
+            else [str(i) for i in range(self.num_labels)]
+        )
+        if len(self.display_labels) < self.num_labels:
+            self.display_labels.extend(str(i) for i in range(len(self.display_labels), self.num_labels))
         self.encoder = FrameAST_base()
-        self.head = LinearHead(768, 407, use_norm=False, affine=False)
-        self._load_ckpt(ckpt_path)
+        self.head = LinearHead(768, self.num_labels, use_norm=False, affine=False)
+        self._load_state_dict(state_dict)
         self.transform = self._transform()
         self.seconds_per_prediction_frame = (
             self.encoder.patch_w * MEL_HOP_SAMPLES / TARGET_SAMPLE_RATE
@@ -78,15 +103,23 @@ class InferenceAudioSetStrong(nn.Module):
                                    to_db,
                                    normalize])
 
-    def _load_ckpt(self, ckpt_path):
+    def _read_ckpt_state_dict(self, ckpt_path):
         s = torch.load(ckpt_path, map_location="cpu")
         state_dict = s["state_dict"]
         replaced_state_dict = {}
         for key in state_dict.keys():
             replaced_state_dict[key.replace(
                 "encoder.encoder", "encoder")] = state_dict[key]
+        return replaced_state_dict
 
-        self.load_state_dict(replaced_state_dict)
+    def _infer_num_labels(self, state_dict):
+        try:
+            return state_dict["head.linear.weight"].shape[0]
+        except KeyError as exc:
+            raise KeyError("Checkpoint is missing head.linear.weight; cannot infer label count") from exc
+
+    def _load_state_dict(self, state_dict):
+        self.load_state_dict(state_dict)
 
     def _prepare_wav(self, wav):
         if len(wav.shape) == 2:
