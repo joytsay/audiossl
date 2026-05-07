@@ -341,6 +341,20 @@ def compute_psds_metrics(prediction_dfs, eval_tsv, durations_tsv, out_dir):
     }
 
 
+def make_totals(selected):
+    return {
+        name: {
+            "n": 0,
+            "mean_sum": 0.0,
+            "max_sum": 0.0,
+            "p95_sum": 0.0,
+            "truth_n": 0,
+            "truth_max_sum": 0.0,
+        }
+        for _, _, name, _ in selected
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default="models/atst_ft_StrongAS_eps28.ckpt")
@@ -351,13 +365,25 @@ def main():
     parser.add_argument("--eval-tsv", default="AudioSet_strong/meta/eval/eval.tsv")
     parser.add_argument("--eval-durations", default="AudioSet_strong/meta/eval/eval_durations.tsv")
     parser.add_argument("--class-labels", default="AudioSet_strong/class_labels_indices.csv")
-    parser.add_argument("--out-dir", default="eval_label_confidence")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--compute-psds", action="store_true")
     parser.add_argument("--psds-thresholds", type=int, default=50)
     parser.add_argument("--median-kernel", type=int, default=7)
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Write only the top-k selected labels per file, ranked by max confidence.",
+    )
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=3,
+        help="Number of selected labels to write per file when --compact is set.",
+    )
     args = parser.parse_args()
+    if args.topk < 1:
+        raise SystemExit("--topk must be >= 1")
 
     selected_mids, mid_to_name = read_mid_list(args.label_tsv)
     common_labels = read_common_labels(args.common_labels)
@@ -370,24 +396,25 @@ def main():
         raise SystemExit(f"MIDs are not in {args.common_labels}: {missing}")
 
     selected = [
-        (mid, mid_to_name[mid], mid_to_index[mid])
-        for mid in selected_mids
+        (seq, mid, mid_to_name[mid], mid_to_index[mid])
+        for seq, mid in enumerate(selected_mids, start=1)
         if mid in mid_to_index
     ]
     truth = read_eval_truth(
         args.eval_tsv,
-        [mid for mid, _, _ in selected],
-        [name for _, name, _ in selected],
+        [mid for _, mid, _, _ in selected],
+        [name for _, _, name, _ in selected],
         args.class_labels,
     )
 
-    out_dir = Path(args.out_dir)
+    audio_dir = Path(args.audio_dir)
+    out_dir = audio_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     per_file_path = out_dir / "per_file_label_confidence.csv"
     summary_path = out_dir / "summary_label_confidence.csv"
 
     model = AudioSetStrongModel(args.ckpt).to(args.device).eval()
-    wav_paths = sorted(Path(args.audio_dir).glob("*.wav"))
+    wav_paths = sorted(audio_dir.rglob("*.wav"))
     if args.limit is not None:
         wav_paths = wav_paths[: args.limit]
     thresholds = [
@@ -399,35 +426,34 @@ def main():
         for threshold in thresholds
     }
 
-    totals = {
-        name: {
-            "n": 0,
-            "mean_sum": 0.0,
-            "max_sum": 0.0,
-            "p95_sum": 0.0,
-            "truth_n": 0,
-            "truth_max_sum": 0.0,
-        }
-        for _, name, _ in selected
-    }
+    per_file_fieldnames = [
+        "filename",
+        "mid",
+        "display_name",
+        "mean_confidence",
+        "max_confidence",
+        "p95_confidence",
+        "is_ground_truth_label",
+    ]
+    summary_fieldnames = [
+        "display_name",
+        "n_files",
+        "avg_mean_confidence",
+        "avg_max_confidence",
+        "avg_p95_confidence",
+        "n_ground_truth_files",
+        "avg_max_confidence_on_ground_truth",
+    ]
+
+    totals = make_totals(selected)
 
     with per_file_path.open("w", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "filename",
-                "mid",
-                "display_name",
-                "mean_confidence",
-                "max_confidence",
-                "p95_confidence",
-                "is_ground_truth_label",
-            ],
-        )
+        writer = csv.DictWriter(handle, fieldnames=per_file_fieldnames)
         writer.writeheader()
         for file_idx, wav_path in enumerate(wav_paths, start=1):
             if file_idx == 1 or file_idx % 100 == 0 or file_idx == len(wav_paths):
-                print(f"scoring {file_idx}/{len(wav_paths)}: {wav_path.name}")
+                print(f"scoring {file_idx}/{len(wav_paths)}: {wav_path}")
+            output_filename = str(wav_path.relative_to(audio_dir))
             wav = load_audio(wav_path).to(args.device)
             with torch.no_grad():
                 prediction = model(wav)
@@ -440,19 +466,19 @@ def main():
                     median_kernel=args.median_kernel,
                 )
                 merge_prediction_dfs(psds_prediction_dfs, decoded)
-            rows = summarize_prediction(prediction, [idx for _, _, idx in selected])
+            rows = summarize_prediction(prediction, [idx for _, _, _, idx in selected])
             filename_truth = truth.get(wav_path.name, set())
-            for (mid, name, _), row in zip(selected, rows):
+            file_rows = []
+            for (_, mid, name, _), row in zip(selected, rows):
                 is_truth = mid in filename_truth or name in filename_truth
-                writer.writerow(
-                    {
-                        "filename": wav_path.name,
-                        "mid": mid,
-                        "display_name": name,
-                        **row,
-                        "is_ground_truth_label": int(is_truth),
-                    }
-                )
+                output_row = {
+                    "filename": output_filename,
+                    "mid": mid,
+                    "display_name": name,
+                    **row,
+                    "is_ground_truth_label": int(is_truth),
+                }
+                file_rows.append(output_row)
                 totals[name]["n"] += 1
                 totals[name]["mean_sum"] += row["mean_confidence"]
                 totals[name]["max_sum"] += row["max_confidence"]
@@ -460,22 +486,19 @@ def main():
                 if is_truth:
                     totals[name]["truth_n"] += 1
                     totals[name]["truth_max_sum"] += row["max_confidence"]
+            if args.compact:
+                file_rows = sorted(
+                    file_rows,
+                    key=lambda row: row["max_confidence"],
+                    reverse=True,
+                )[: args.topk]
+            for row in file_rows:
+                writer.writerow(row)
 
     with summary_path.open("w", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "display_name",
-                "n_files",
-                "avg_mean_confidence",
-                "avg_max_confidence",
-                "avg_p95_confidence",
-                "n_ground_truth_files",
-                "avg_max_confidence_on_ground_truth",
-            ],
-        )
+        writer = csv.DictWriter(handle, fieldnames=summary_fieldnames)
         writer.writeheader()
-        for _, name, _ in selected:
+        for _, _, name, _ in selected:
             total = totals[name]
             n = max(total["n"], 1)
             truth_n = total["truth_n"]
