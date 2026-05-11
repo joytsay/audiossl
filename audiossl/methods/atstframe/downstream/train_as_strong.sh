@@ -3,11 +3,11 @@ python -m audiossl.methods.atstframe.downstream.train_as_strong \
 --learning_rate 1e-2 \
 --arch frameatst \
 --pretrained_ckpt_path "/workspace/models/atst_ft_StrongAS_eps28.ckpt" \
---dcase_conf "/workspace/audiossl/methods/atstframe/downstream/utils_as_strong/conf/frame_6.yaml" \
+--dcase_conf "/workspace/audiossl/methods/atstframe/downstream/utils_as_strong/conf/frame_street.yaml" \
 --dataset_name as_strong \
---save_path "./logs/as_strong_small/" \
---batch_size_per_gpu 2 \
---num_workers 2 \
+--save_path "./logs/as_strong_street_freeze/" \
+--batch_size_per_gpu 32 \
+--num_workers 8 \
 --prefix "_small_freeze" \
 --max_epochs 30 \
 --warmup_epochs 1 \
