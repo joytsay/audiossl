@@ -137,6 +137,17 @@ def read_label_map(label_tsv):
     return label_map
 
 
+def write_label_order(root_path, label_map):
+    meta_dir = root_path / "meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    label_order_path = meta_dir / "label_order.tsv"
+    with label_order_path.open("w", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        for mid, display_name in label_map.items():
+            writer.writerow([mid, display_name])
+    return label_order_path
+
+
 def can_decode_audio(path):
     try:
         import torchaudio
@@ -591,6 +602,7 @@ def main():
     label_tsv = args.label_tsv.resolve()
 
     label_map = read_label_map(label_tsv)
+    label_order_path = write_label_order(root_path, label_map)
     if args.source == "huggingface":
         summaries = create_huggingface_subset(args, root_path, label_map)
     else:
@@ -599,6 +611,7 @@ def main():
     print(f"Output ROOT_PATH: {root_path}")
     print(f"Source: {args.source}")
     print(f"Selected classes: {len(label_map)} from {label_tsv}")
+    print(f"Label order: {label_order_path}")
     for summary in summaries:
         print(
             "{split}: tsv_rows={tsv_rows} matched_rows={matched_rows} "

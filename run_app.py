@@ -27,9 +27,13 @@ from audiossl.methods.atstframe.downstream.Inference_audioset_strong import (
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RTSP_URL = "rtsp://admin:Admin123@192.168.5.157:554/profile1"
-DEFAULT_LABEL_TSV = REPO_ROOT / "mid_office_indoor_display_name.tsv"
+DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_10.tsv"
+# DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_display_name.tsv"
 # DEFAULT_CKPT = REPO_ROOT / "models" / "atst_ft_StrongAS_eps28.ckpt"
-DEFAULT_CKPT = REPO_ROOT / "logs" /"as_strong_small" / "frameatst_small_freeze"  / "last.ckpt"
+# DEFAULT_CKPT = REPO_ROOT / "logs" /"as_strong_small" / "frameatst_small_freeze"  / "last.ckpt"
+# DEFAULT_CKPT = REPO_ROOT/ "logs" / "as_strong_street_refine" / "frameatst_small_freeze_finetune" / "last.ckpt"
+DEFAULT_CKPT = REPO_ROOT/ "logs" / "as_strong_street_10_finetune" / "frameatst_small_freeze_lr_scale_0.75_finetune" / "last.ckpt"
+
 LABEL_TSV_CHOICES = [
     "mid_10_display_name.tsv",
     "mid_20_display_name.tsv",
@@ -77,9 +81,22 @@ class PredictionState:
 
 class LabelMapper:
     def __init__(self, label_tsv: Path, model_labels: Optional[Sequence[str]] = None):
-        self.common_mids = list(model_labels) if model_labels is not None else self._read_common_mids()
+        selected_mids = self._read_label_mids(label_tsv)
+        if model_labels is not None and len(selected_mids) == len(model_labels):
+            self.common_mids = selected_mids
+        else:
+            self.common_mids = self._read_common_mids()
         self.mid_to_name = self._read_mid_names()
-        self.selected = self._read_selected(label_tsv)
+        self.selected = self._read_selected(selected_mids)
+
+    def display_names(self) -> List[str]:
+        return [self.mid_to_name.get(mid, mid) for mid in self.common_mids]
+
+    def selected_display_names(self) -> List[str]:
+        return [
+            self.mid_to_name.get(self.common_mids[idx], self.common_mids[idx])
+            for idx in self.selected
+        ]
 
     def _read_common_mids(self) -> List[str]:
         path = REPO_ROOT / "common_labels.txt"
@@ -96,13 +113,17 @@ class LabelMapper:
                     names[parts[0]] = parts[1]
         return names
 
-    def _read_selected(self, label_tsv: Path) -> List[int]:
-        wanted = set()
+    def _read_label_mids(self, label_tsv: Path) -> List[str]:
+        mids = []
         with label_tsv.open("r", encoding="utf-8") as f:
             for line in f:
                 parts = line.rstrip("\n").split("\t", 1)
                 if parts and parts[0]:
-                    wanted.add(parts[0])
+                    mids.append(parts[0])
+        return mids
+
+    def _read_selected(self, selected_mids: Sequence[str]) -> List[int]:
+        wanted = set(selected_mids)
         indices = [i for i, mid in enumerate(
             self.common_mids) if mid in wanted]
         if not indices:
@@ -267,8 +288,8 @@ class RtspInferenceWorker:
 
             device = _resolve_device(torch, device_name)
             model = InferenceAudioSetStrong(str(Path(ckpt_path).expanduser()))
-            self._set_active_labels(model.display_labels)
             labels = LabelMapper(Path(label_tsv).expanduser(), model.display_labels)
+            self._set_active_labels(labels.selected_display_names())
             model.to(device)
             if hasattr(model, "transform"):
                 model.transform = _move_transform_to_device(
@@ -494,7 +515,7 @@ def create_gradio_app():
                      silence_gate_enabled, silence_rms_threshold,
                      silence_peak_threshold)
         snapshot = worker.snapshot()
-        snapshot.active_labels = load_checkpoint_labels(ckpt_path)
+        snapshot.active_labels = load_tsv_labels(label_tsv).get("labels", [])
         return _format_outputs(snapshot, top1_alert_threshold)
 
     def disconnect(top1_alert_threshold):
@@ -587,7 +608,6 @@ def create_gradio_app():
         all_labels = gr.JSON(label="All labels",
                              value=_format_active_labels(PredictionState(
                                  label_tsv=str(DEFAULT_LABEL_TSV),
-                                 active_labels=load_checkpoint_labels(str(DEFAULT_CKPT)),
                              )))
         timer = gr.Timer(value=1.0, active=True)
 
