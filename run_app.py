@@ -1,9 +1,11 @@
 import argparse
+import csv
 import html
 import inspect
 import queue
 import re
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -26,15 +28,27 @@ from audiossl.methods.atstframe.downstream.Inference_audioset_strong import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+PRETRAINED_SED_ROOT = REPO_ROOT / "PretrainedSED"
+PRETRAINED_SED_ATST_STRONG_CKPT = REPO_ROOT / "models" / "ATST-F_strong_1.pt"
 DEFAULT_RTSP_URL = "rtsp://admin:Admin123@192.168.5.157:554/profile1"
-DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_10.tsv"
+DEFAULT_LABEL_TSV = REPO_ROOT / "mid_to_display_name.tsv"
 # DEFAULT_LABEL_TSV = REPO_ROOT / "mid_street_surveillance_display_name.tsv"
-# DEFAULT_CKPT = REPO_ROOT / "models" / "atst_ft_StrongAS_eps28.ckpt"
+# BASE_CKPT = REPO_ROOT / "models" / "atst_ft_StrongAS_eps28.ckpt"
+BASE_CKPT = REPO_ROOT / "models" / "atst_as2M.ckpt"
+# BASE_CKPT = REPO_ROOT / "models" / "atstframe_base.ckpt"
+# BASE_CKPT = REPO_ROOT / "models" / "ATST-F_strong_1.pt"
+FINETUNE_CKPT = REPO_ROOT/ "logs" / "as_strong_street_10_finetune" / "frameatst_small_freeze_lr_scale_0.75_finetune" / "last.ckpt"
 # DEFAULT_CKPT = REPO_ROOT / "logs" /"as_strong_small" / "frameatst_small_freeze"  / "last.ckpt"
-# DEFAULT_CKPT = REPO_ROOT/ "logs" / "as_strong_street_refine" / "frameatst_small_freeze_finetune" / "last.ckpt"
-DEFAULT_CKPT = REPO_ROOT/ "logs" / "as_strong_street_10_finetune" / "frameatst_small_freeze_lr_scale_0.75_finetune" / "last.ckpt"
+DEFAULT_CKPT = PRETRAINED_SED_ATST_STRONG_CKPT
+
+MODEL_PRESETS = {
+    "PretrainedSED ATST-F strong": PRETRAINED_SED_ATST_STRONG_CKPT,
+    "ATST_ft_StrongAS_eps28": BASE_CKPT,
+    "Street 10 finetune": FINETUNE_CKPT,
+}
 
 LABEL_TSV_CHOICES = [
+    "mid_street_surveillance_10.tsv",
     "mid_10_display_name.tsv",
     "mid_20_display_name.tsv",
     "mid_indoor_cctv_display_name.tsv",
@@ -48,6 +62,7 @@ TARGET_SAMPLE_RATE = 16000
 CHANNELS = 1
 BYTES_PER_SAMPLE = 2
 DEFAULT_SILENCE_GATE_ENABLED = True
+DEFAULT_MEDIAN_FILTER_ENABLED = True
 DEFAULT_SILENCE_RMS_THRESHOLD = 0.005
 DEFAULT_SILENCE_PEAK_THRESHOLD = 0.03
 DEFAULT_TOP1_ALERT_THRESHOLD = 0.01
@@ -56,6 +71,15 @@ FFMPEG_IGNORED_ERROR_PATTERNS = (
     r"error parsing debug value debug=0",
     r"Enter command: <target>\|all <time>\|-1 <command>\[ <argument>\]",
 )
+
+
+def _same_path(left: str | Path, right: str | Path) -> bool:
+    left_path = Path(left).expanduser()
+    right_path = Path(right).expanduser()
+    try:
+        return left_path.resolve() == right_path.resolve()
+    except FileNotFoundError:
+        return left_path.absolute() == right_path.absolute()
 
 
 @dataclass
@@ -73,6 +97,7 @@ class PredictionState:
     rms: float = 0.0
     peak: float = 0.0
     silence_gate_enabled: bool = DEFAULT_SILENCE_GATE_ENABLED
+    median_filter_enabled: bool = DEFAULT_MEDIAN_FILTER_ENABLED
     silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD
     silence_peak_threshold: float = DEFAULT_SILENCE_PEAK_THRESHOLD
     top_labels: List[Dict[str, Any]] = field(default_factory=list)
@@ -80,23 +105,58 @@ class PredictionState:
 
 
 class LabelMapper:
-    def __init__(self, label_tsv: Path, model_labels: Optional[Sequence[str]] = None):
+    def __init__(
+        self,
+        label_tsv: Path,
+        model_labels: Optional[Sequence[str]] = None,
+        model_label_path: Optional[Path] = None,
+    ):
         selected_mids = self._read_label_mids(label_tsv)
-        if model_labels is not None and len(selected_mids) == len(model_labels):
-            self.common_mids = selected_mids
-        else:
-            self.common_mids = self._read_common_mids()
         self.mid_to_name = self._read_mid_names()
+        self.index_mids = self._read_index_mids(
+            selected_mids,
+            model_labels=model_labels,
+            model_label_path=model_label_path,
+        )
+        self.index_names = self._read_index_names(model_labels)
         self.selected = self._read_selected(selected_mids)
 
     def display_names(self) -> List[str]:
-        return [self.mid_to_name.get(mid, mid) for mid in self.common_mids]
+        return [self._display_name(idx) for idx in range(len(self.index_names))]
 
     def selected_display_names(self) -> List[str]:
-        return [
-            self.mid_to_name.get(self.common_mids[idx], self.common_mids[idx])
-            for idx in self.selected
-        ]
+        return [self._display_name(idx) for idx in self.selected]
+
+    def _display_name(self, idx: int) -> str:
+        if idx < len(self.index_names):
+            return self.index_names[idx]
+        if idx < len(self.index_mids):
+            mid = self.index_mids[idx]
+            return self.mid_to_name.get(mid, mid)
+        return str(idx)
+
+    def _read_index_names(self, model_labels: Optional[Sequence[str]]) -> List[str]:
+        if model_labels:
+            return [str(label) for label in model_labels]
+        return [self.mid_to_name.get(mid, mid) for mid in self.index_mids]
+
+    def _read_index_mids(
+        self,
+        selected_mids: Sequence[str],
+        model_labels: Optional[Sequence[str]],
+        model_label_path: Optional[Path],
+    ) -> List[str]:
+        num_model_labels = len(model_labels) if model_labels is not None else None
+        if model_label_path is not None:
+            model_mids = self._read_label_mids(model_label_path)
+            if num_model_labels is None or len(model_mids) == num_model_labels:
+                return model_mids
+        if num_model_labels is not None and len(selected_mids) == num_model_labels:
+            return list(selected_mids)
+        common_mids = self._read_common_mids()
+        if num_model_labels is None or len(common_mids) == num_model_labels:
+            return common_mids
+        return []
 
     def _read_common_mids(self) -> List[str]:
         path = REPO_ROOT / "common_labels.txt"
@@ -114,6 +174,13 @@ class LabelMapper:
         return names
 
     def _read_label_mids(self, label_tsv: Path) -> List[str]:
+        if label_tsv.suffix == ".csv":
+            with label_tsv.open(newline="", encoding="utf-8") as f:
+                return [
+                    row["mid"]
+                    for row in csv.DictReader(f)
+                    if row.get("mid")
+                ]
         mids = []
         with label_tsv.open("r", encoding="utf-8") as f:
             for line in f:
@@ -124,10 +191,9 @@ class LabelMapper:
 
     def _read_selected(self, selected_mids: Sequence[str]) -> List[int]:
         wanted = set(selected_mids)
-        indices = [i for i, mid in enumerate(
-            self.common_mids) if mid in wanted]
+        indices = [i for i, mid in enumerate(self.index_mids) if mid in wanted]
         if not indices:
-            indices = list(range(len(self.common_mids)))
+            indices = list(range(len(self.index_names)))
         return indices
 
     def topk(self, scores: Sequence[float], k: int = 3) -> List[Dict[str, Any]]:
@@ -135,16 +201,96 @@ class LabelMapper:
         selected_scores.sort(key=lambda item: item[1], reverse=True)
         results = []
         for rank, (label_index, confidence) in enumerate(selected_scores[:k], start=1):
-            mid = self.common_mids[label_index]
+            mid = self.index_mids[label_index] if label_index < len(self.index_mids) else str(label_index)
             results.append(
                 {
                     "rank": rank,
                     "mid": mid,
-                    "label": self.mid_to_name.get(mid, mid),
+                    "label": self._display_name(label_index),
                     "confidence": confidence,
                 }
             )
         return results
+
+
+class PretrainedSedAtstStrong:
+    def __init__(self, ckpt_path: Path = PRETRAINED_SED_ATST_STRONG_CKPT):
+        if not PRETRAINED_SED_ROOT.exists():
+            raise FileNotFoundError(f"{PRETRAINED_SED_ROOT} does not exist")
+        ckpt_path = Path(ckpt_path).expanduser()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"{ckpt_path} does not exist")
+        if str(PRETRAINED_SED_ROOT) not in sys.path:
+            sys.path.insert(0, str(PRETRAINED_SED_ROOT))
+
+        from data_util import audioset_classes
+        from models.atstframe.ATSTF_wrapper import ATSTWrapper
+        from models.prediction_wrapper import PredictionsWrapper
+
+        self.model = PredictionsWrapper(ATSTWrapper(), checkpoint=None)
+        state_dict = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        allowed_missing = {
+            key for key in self.model.state_dict()
+            if "mel_transform" in key
+        }
+        unexpected_missing = set(missing) - allowed_missing
+        if unexpected_missing or unexpected:
+            raise RuntimeError(
+                f"Could not load {ckpt_path}: missing={sorted(unexpected_missing)}, unexpected={unexpected}"
+            )
+        self.display_labels = list(audioset_classes.as_strong_train_classes)
+        self.label_path = None
+        self.index_mids = _mids_for_display_labels(self.display_labels)
+
+    def to(self, device):
+        self.model.to(device)
+        return self
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def predict(self, wav):
+        mel = self.model.mel_forward(wav)
+        strong, _ = self.model(mel)
+        return torch.sigmoid(strong)
+
+
+def _mids_for_display_labels(display_labels: Sequence[str]) -> List[str]:
+    display_to_mid = {}
+    path = REPO_ROOT / "mid_to_display_name.tsv"
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t", 1)
+            if len(parts) == 2:
+                display_to_mid.setdefault(parts[1], parts[0])
+    return [display_to_mid.get(label, str(index)) for index, label in enumerate(display_labels)]
+
+
+def _pretrained_sed_display_labels() -> List[str]:
+    if str(PRETRAINED_SED_ROOT) not in sys.path:
+        sys.path.insert(0, str(PRETRAINED_SED_ROOT))
+    from data_util import audioset_classes
+
+    return list(audioset_classes.as_strong_train_classes)
+
+
+def _pretrained_sed_active_labels(label_tsv: str) -> List[str]:
+    display_labels = _pretrained_sed_display_labels()
+    mapper = LabelMapper(
+        Path(label_tsv).expanduser(),
+        model_labels=display_labels,
+    )
+    mapper.index_mids = _mids_for_display_labels(display_labels)
+    mapper.selected = mapper._read_selected(mapper._read_label_mids(Path(label_tsv).expanduser()))
+    return mapper.selected_display_names()
+
+
+def load_model(ckpt_path: str):
+    if _same_path(ckpt_path, PRETRAINED_SED_ATST_STRONG_CKPT):
+        return PretrainedSedAtstStrong()
+    return InferenceAudioSetStrong(str(Path(ckpt_path).expanduser()))
 
 
 class RtspInferenceWorker:
@@ -171,6 +317,7 @@ class RtspInferenceWorker:
                 rms=self.state.rms,
                 peak=self.state.peak,
                 silence_gate_enabled=self.state.silence_gate_enabled,
+                median_filter_enabled=self.state.median_filter_enabled,
                 silence_rms_threshold=self.state.silence_rms_threshold,
                 silence_peak_threshold=self.state.silence_peak_threshold,
                 top_labels=list(self.state.top_labels),
@@ -187,6 +334,7 @@ class RtspInferenceWorker:
         update_every_frames: int = 5,
         top_n: int = 3,
         silence_gate_enabled: bool = DEFAULT_SILENCE_GATE_ENABLED,
+        median_filter_enabled: bool = DEFAULT_MEDIAN_FILTER_ENABLED,
         silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD,
         silence_peak_threshold: float = DEFAULT_SILENCE_PEAK_THRESHOLD,
     ) -> None:
@@ -203,6 +351,7 @@ class RtspInferenceWorker:
                 status="Starting",
                 error="",
                 silence_gate_enabled=silence_gate_enabled,
+                median_filter_enabled=median_filter_enabled,
                 silence_rms_threshold=silence_rms_threshold,
                 silence_peak_threshold=silence_peak_threshold,
             )
@@ -210,7 +359,7 @@ class RtspInferenceWorker:
             target=self._run,
             args=(rtsp_url, label_tsv, ckpt_path, device,
                   window_seconds, update_every_frames, top_n,
-                  silence_gate_enabled, silence_rms_threshold,
+                  silence_gate_enabled, median_filter_enabled, silence_rms_threshold,
                   silence_peak_threshold),
             daemon=True,
         )
@@ -278,6 +427,7 @@ class RtspInferenceWorker:
         update_every_frames: int,
         top_n: int,
         silence_gate_enabled: bool,
+        median_filter_enabled: bool,
         silence_rms_threshold: float,
         silence_peak_threshold: float,
     ) -> None:
@@ -287,8 +437,15 @@ class RtspInferenceWorker:
                     "ffmpeg is required but was not found on PATH")
 
             device = _resolve_device(torch, device_name)
-            model = InferenceAudioSetStrong(str(Path(ckpt_path).expanduser()))
-            labels = LabelMapper(Path(label_tsv).expanduser(), model.display_labels)
+            model = load_model(ckpt_path)
+            labels = LabelMapper(
+                Path(label_tsv).expanduser(),
+                model_labels=model.display_labels,
+                model_label_path=getattr(model, "label_path", None),
+            )
+            if getattr(model, "index_mids", None):
+                labels.index_mids = list(model.index_mids)
+                labels.selected = labels._read_selected(labels._read_label_mids(Path(label_tsv).expanduser()))
             self._set_active_labels(labels.selected_display_names())
             model.to(device)
             if hasattr(model, "transform"):
@@ -364,7 +521,11 @@ class RtspInferenceWorker:
                 wav = torch.from_numpy(audio.copy()).unsqueeze(0).to(device)
                 with torch.no_grad():
                     prediction = model.predict(wav)
-                scores = prediction[0, :, -update_every_frames:].mean(dim=1)
+                recent_scores = prediction[0, :, -update_every_frames:]
+                if median_filter_enabled:
+                    scores = recent_scores.median(dim=1).values
+                else:
+                    scores = recent_scores.mean(dim=1)
                 top_labels = labels.topk(scores.detach().cpu().tolist(), k=top_n)
                 self._set_prediction(frame_index, top_labels, rms, peak)
 
@@ -447,6 +608,7 @@ def create_fastapi_app():
         update_every_frames: int = 5
         top_n: int = 3
         silence_gate_enabled: bool = DEFAULT_SILENCE_GATE_ENABLED
+        median_filter_enabled: bool = DEFAULT_MEDIAN_FILTER_ENABLED
         silence_rms_threshold: float = DEFAULT_SILENCE_RMS_THRESHOLD
         silence_peak_threshold: float = DEFAULT_SILENCE_PEAK_THRESHOLD
 
@@ -467,6 +629,7 @@ def create_fastapi_app():
             "rms": snapshot.rms,
             "peak": snapshot.peak,
             "silence_gate_enabled": snapshot.silence_gate_enabled,
+            "median_filter_enabled": snapshot.median_filter_enabled,
             "silence_rms_threshold": snapshot.silence_rms_threshold,
             "silence_peak_threshold": snapshot.silence_peak_threshold,
             "top_labels": snapshot.top_labels,
@@ -483,6 +646,7 @@ def create_fastapi_app():
             request.update_every_frames,
             request.top_n,
             request.silence_gate_enabled,
+            request.median_filter_enabled,
             request.silence_rms_threshold,
             request.silence_peak_threshold,
         )
@@ -507,15 +671,15 @@ def create_gradio_app():
         top_n,
         top1_alert_threshold,
         silence_gate_enabled,
+        median_filter_enabled,
         silence_rms_threshold,
         silence_peak_threshold,
     ):
         worker.start(rtsp_url, label_tsv, ckpt_path, device,
                      window_seconds, update_every_frames, top_n,
-                     silence_gate_enabled, silence_rms_threshold,
+                     silence_gate_enabled, median_filter_enabled, silence_rms_threshold,
                      silence_peak_threshold)
         snapshot = worker.snapshot()
-        snapshot.active_labels = load_tsv_labels(label_tsv).get("labels", [])
         return _format_outputs(snapshot, top1_alert_threshold)
 
     def disconnect(top1_alert_threshold):
@@ -534,6 +698,9 @@ def create_gradio_app():
         snapshot.label_tsv = path
         return path, _format_active_labels(snapshot)
 
+    def select_model_preset(model_name):
+        return str(MODEL_PRESETS.get(model_name, DEFAULT_CKPT))
+
     with gr.Blocks(title="GeoVision Sound-Event-Detection") as demo:
         gr.Markdown("# GeoVision Sound-Event-Detection")
         with gr.Row():
@@ -550,6 +717,13 @@ def create_gradio_app():
             )
             label_tsv = gr.Textbox(
                 label="Label TSV", value=str(DEFAULT_LABEL_TSV), scale=2)
+        with gr.Row():
+            model_choice = gr.Dropdown(
+                label="Model preset",
+                choices=list(MODEL_PRESETS.keys()),
+                value="PretrainedSED ATST-F strong",
+                scale=1,
+            )
             ckpt_path = gr.Textbox(
                 label="Checkpoint", value=str(DEFAULT_CKPT), scale=2)
         with gr.Row():
@@ -582,6 +756,10 @@ def create_gradio_app():
                 step=0.005,
             )
         with gr.Row():
+            median_filter_enabled = gr.Checkbox(
+                label="Median filter",
+                value=DEFAULT_MEDIAN_FILTER_ENABLED,
+            )
             silence_gate_enabled = gr.Checkbox(
                 label="Silence gate",
                 value=DEFAULT_SILENCE_GATE_ENABLED,
@@ -616,7 +794,7 @@ def create_gradio_app():
             inputs=[rtsp_url, label_tsv, ckpt_path, device,
                     window_seconds, update_every_frames, top_n,
                     top1_alert_threshold,
-                    silence_gate_enabled, silence_rms_threshold,
+                    silence_gate_enabled, median_filter_enabled, silence_rms_threshold,
                     silence_peak_threshold],
             outputs=[output, top1_alert, all_labels],
         )
@@ -627,6 +805,7 @@ def create_gradio_app():
         )
         label_choice.change(select_label_tsv, inputs=label_choice, outputs=[
                             label_tsv, all_labels])
+        model_choice.change(select_model_preset, inputs=model_choice, outputs=ckpt_path)
         timer.tick(poll, inputs=top1_alert_threshold, outputs=[output, top1_alert, all_labels])
 
     return demo
@@ -684,6 +863,7 @@ def _format_snapshot(snapshot: PredictionState) -> Dict[str, Any]:
         "rms": snapshot.rms,
         "peak": snapshot.peak,
         "silence_gate_enabled": snapshot.silence_gate_enabled,
+        "median_filter_enabled": snapshot.median_filter_enabled,
         "silence_rms_threshold": snapshot.silence_rms_threshold,
         "silence_peak_threshold": snapshot.silence_peak_threshold,
         "top_labels": snapshot.top_labels,
@@ -698,13 +878,34 @@ def _format_active_labels(snapshot: PredictionState) -> Dict[str, Any]:
             "count": len(snapshot.active_labels),
             "labels": snapshot.active_labels,
         }
+    if _same_path(snapshot.ckpt_path, PRETRAINED_SED_ATST_STRONG_CKPT):
+        try:
+            labels = _pretrained_sed_active_labels(snapshot.label_tsv)
+            return {
+                "source": "PretrainedSED ATST-F strong labels",
+                "count": len(labels),
+                "labels": labels,
+            }
+        except Exception as exc:
+            return {
+                "source": "PretrainedSED ATST-F strong labels",
+                "count": 0,
+                "labels": [],
+                "error": str(exc),
+            }
     return load_tsv_labels(snapshot.label_tsv)
 
 
 def load_checkpoint_labels(ckpt_path: str) -> List[str]:
     try:
-        checkpoint = torch.load(str(Path(ckpt_path).expanduser()), map_location="cpu")
-        state_dict = checkpoint["state_dict"]
+        if _same_path(ckpt_path, PRETRAINED_SED_ATST_STRONG_CKPT):
+            return _pretrained_sed_display_labels()
+        checkpoint = torch.load(
+            str(Path(ckpt_path).expanduser()),
+            map_location="cpu",
+            weights_only=False,
+        )
+        state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         num_labels = state_dict["head.linear.weight"].shape[0]
         label_path = infer_label_path(num_labels)
         if label_path:
